@@ -24,6 +24,7 @@ mloda = false
 members = [
     "mloda-community",
     "mloda-community-aggregation",
+    "mloda-community-binary-model",
     "mloda-community-binning",
     "mloda-community-compute-frameworks-example",
     "mloda-community-data-operations",
@@ -51,6 +52,7 @@ members = [
     "mloda-community-window-aggregation",
     "mloda-enterprise",
     "mloda-enterprise-audit",
+    "mloda-enterprise-binary-example",
     "mloda-enterprise-compute-frameworks-example",
     "mloda-enterprise-example",
     "mloda-enterprise-extenders-example",
@@ -672,6 +674,32 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
 ]
 provides-extras = ["dev", "pyarrow", "sqlite", "python-dict", "duckdb", "polars", "pandas", "all"]
+
+[[package]]
+name = "mloda-community-binary-model"
+version = "0.4.7"
+source = { editable = "mloda/community/feature_groups/binary_model" }
+dependencies = [
+    { name = "mloda" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "mloda-testing", extra = ["binary-model"] },
+    { name = "pytest" },
+]
+pyarrow = [
+    { name = "pyarrow" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mloda", specifier = ">=0.13.0,<0.14.0" },
+    { name = "mloda-testing", extras = ["binary-model"], marker = "extra == 'dev'" },
+    { name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=25" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
+]
+provides-extras = ["dev", "pyarrow"]
 
 [[package]]
 name = "mloda-community-binning"
@@ -1695,10 +1723,14 @@ version = "0.4.7"
 source = { editable = "mloda/enterprise" }
 dependencies = [
     { name = "mloda" },
+    { name = "mloda-community" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mloda", specifier = ">=0.13.0,<0.14.0" }]
+requires-dist = [
+    { name = "mloda", specifier = ">=0.13.0,<0.14.0" },
+    { name = "mloda-community", editable = "mloda/community" },
+]
 
 [[package]]
 name = "mloda-enterprise-audit"
@@ -1721,6 +1753,32 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
 ]
 provides-extras = ["dev"]
+
+[[package]]
+name = "mloda-enterprise-binary-example"
+version = "0.4.7"
+source = { editable = "mloda/enterprise/feature_groups/binary_example" }
+dependencies = [
+    { name = "mloda-community-binary-model" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "mloda-testing", extra = ["binary-model"] },
+    { name = "pytest" },
+]
+pyarrow = [
+    { name = "pyarrow" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "mloda-community-binary-model", specifier = ">=0.4.7" },
+    { name = "mloda-testing", extras = ["binary-model"], marker = "extra == 'dev'" },
+    { name = "pyarrow", marker = "extra == 'pyarrow'", specifier = ">=25" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
+]
+provides-extras = ["dev", "pyarrow"]
 
 [[package]]
 name = "mloda-enterprise-compute-frameworks-example"
