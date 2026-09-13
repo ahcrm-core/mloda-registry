@@ -1,50 +1,61 @@
-"""Root setuptools package discovery must not ship in-tree test packages in the workspace wheel."""
+"""Published wheels must not ship in-tree test packages.
+
+``[tool.setuptools.packages.find]`` includes ``mloda*`` with namespace
+discovery. Without an exclude list, every ``tests`` directory under ``mloda/``
+becomes a packaged module. See issue #594.
+"""
 
 from __future__ import annotations
 
-import fnmatch
 import sys
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    import tomli as tomllib  # type: ignore[import-not-found,unused-ignore]
+    import tomli as tomllib  # type: ignore[import-not-found, unused-ignore]
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 _PACKAGE_ROOT = _REPO_ROOT / "mloda"
 
-
-def _package_name(tests_dir: Path) -> str:
-    """Dotted package name for a tests directory under the included package tree."""
-    return ".".join(tests_dir.relative_to(_REPO_ROOT).parts)
-
-
-def _covered(package_name: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatch(package_name, pattern) for pattern in patterns)
+# Patterns required by issue #594. ``*.tests`` matches the tests package itself;
+# ``*.tests.*`` matches modules and subpackages under it.
+_REQUIRED_EXCLUDES = {"*.tests", "*.tests.*"}
 
 
-def test_setuptools_find_excludes_every_in_tree_tests_package() -> None:
-    """[tool.setuptools.packages.find] exclude must match every tests package under mloda/."""
-    config = tomllib.loads(_PYPROJECT.read_text())
-    setuptools = config["tool"]["setuptools"]
-    find = setuptools["packages"]["find"]
+def _setuptools_config() -> dict[object, object]:
+    data = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
+    return data["tool"]["setuptools"]  # type: ignore[no-any-return]
 
-    assert setuptools.get("include-package-data") is False, (
-        "[tool.setuptools] include-package-data must be false so a stale SOURCES.txt "
-        "cannot re-add excluded test modules as package data"
-    )
-    patterns = list(find.get("exclude") or [])
-    assert "*.tests" in patterns
-    assert "*.tests.*" in patterns
 
+def test_include_package_data_is_disabled() -> None:
+    """Stale egg-info SOURCES.txt re-adds excluded tests when package data is on."""
+    setuptools = _setuptools_config()
+    assert setuptools.get("include-package-data") is False
+
+
+def test_packages_find_excludes_tests_patterns() -> None:
+    setuptools = _setuptools_config()
+    find = setuptools["packages"]["find"]  # type: ignore[index]
+    excludes = set(find.get("exclude") or [])
+    missing = _REQUIRED_EXCLUDES - excludes
+    assert not missing, f"pyproject.toml is missing exclude patterns: {sorted(missing)}"
+
+
+def test_exclude_patterns_cover_every_tests_directory() -> None:
+    """Every tests/ directory under mloda/ must match *.tests or *.tests.*"""
     tests_dirs = sorted(path for path in _PACKAGE_ROOT.rglob("tests") if path.is_dir())
     assert tests_dirs, "expected in-tree tests directories under mloda/"
 
-    uncovered = [
-        _package_name(path) for path in tests_dirs if not _covered(_package_name(path), patterns)
-    ]
-    assert not uncovered, (
-        "setuptools exclude patterns do not cover these tests packages: " + ", ".join(uncovered)
-    )
+    uncovered: list[str] = []
+    for tests_dir in tests_dirs:
+        relative = tests_dir.relative_to(_REPO_ROOT)
+        dotted = ".".join(relative.parts)
+        # ``foo.bar.tests`` matches ``*.tests``; a nested ``foo.bar.tests.unit``
+        # would match ``*.tests.*``.
+        covered = dotted.endswith(".tests") or ".tests." in dotted
+        if not covered:
+            uncovered.append(str(relative))
+
+    assert not uncovered, f"tests directories not covered by *.tests / *.tests.*: {uncovered}"
