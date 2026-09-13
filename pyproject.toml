@@ -53,9 +53,13 @@ known-third-party = ["mloda.user", "mloda.provider", "mloda.steward", "mloda_plu
 [tool.ruff.lint.per-file-ignores]
 "**/tests/**" = ["E402"]
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mloda*"]
+exclude = ["*.tests", "*.tests.*"]
 namespaces = true
 
 [tool.pytest.ini_options]
