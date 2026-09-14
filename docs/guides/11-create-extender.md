@@ -38,7 +38,7 @@ Q3: Need state with ParallelizationMode.MULTIPROCESSING?
 | `VALIDATE_INPUT_FEATURE` | Before calculation |
 | `VALIDATE_OUTPUT_FEATURE` | After calculation |
 | `FEATURE_GROUP_MATCHED` | Wraps feature group resolution |
-| `INPUT_DATA_LOAD` | Wraps input data loading |
+| `INPUT_DATA_LOAD` | Wraps input data loading inside the active calculation context ([details](#hook-context-for-data-loads)) |
 | `JOIN` | Wraps merging joined data |
 
 ## Example
@@ -92,6 +92,26 @@ Adding an extender opts a pipeline into instrumentation, not into ambient config
 from mloda.user import mloda
 
 results = mloda.run_all(features=["my_feature"], function_extender={MyExtender(), OtherExtender()})
+```
+
+## Hook context for data loads
+
+`INPUT_DATA_LOAD` runs nested inside the active `FEATURE_GROUP_CALCULATE_FEATURE` call, but an extender may wrap it alone: the calculation context is activated whenever either hook has an extender registered, so a data-load wrapper still fires when nothing wraps `FEATURE_GROUP_CALCULATE_FEATURE`.
+
+Its `HookContext` inherits the enclosing calculation's feature-group and feature identity fields (`feature_group_class`, `feature_group_version`, `plugin_version`, `feature_names`, `input_features`), then adds `data_access_identity` and `data_access_format` for the input being read. The enclosing calculation context does not carry those data-access fields, and `rows_in` is left unset here.
+
+`data_access_identity` is sanitized, but it is not guaranteed to be credential-free. URI user information such as `user:password@` is stripped, while a URI query string is retained. If query parameters can contain SAS tokens, presigned signatures, or other secrets, do not persist this field without additional redaction.
+
+## Verified run context
+
+Use `mloda.steward.verified_context()` around the run call when an extender needs server-verified tenant, project, or principal identity. These values populate `tenant_id`, `project_id`, and `principal` on every `HookContext` created for that run and cannot be overridden through feature `Options`.
+
+```python
+from mloda.steward import verified_context
+from mloda.user import mloda
+
+with verified_context(tenant_id="tenant-42", project_id="project-7", principal="service-account"):
+    results = mloda.run_all(features=["my_feature"], function_extender={MyExtender()})
 ```
 
 ## Testing
