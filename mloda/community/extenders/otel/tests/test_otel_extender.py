@@ -21,9 +21,11 @@ from unittest.mock import patch
 import pytest
 from mloda.core.abstract_plugins.hook_context import instrument  # no public equivalent yet
 from mloda.steward import ExtenderHook
+from mloda.user import ParallelizationMode
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
+from opentelemetry.trace import TracerProvider as ApiTracerProvider
 
 from mloda.community.extenders.otel import OtelExtender
 from mloda.community.extenders.otel import otel_extender as otel_extender_module
@@ -210,6 +212,66 @@ class TestOtelExtenderPickling:
                 copy(lambda: None)
 
         assert len(ambient_exporter.get_finished_spans()) == 1
+
+    def test_injected_provider_drop_warns_once_across_repeated_pickling(
+        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider, _ = otel_capture
+        otel = OtelExtender(tracer_provider=provider)
+
+        with caplog.at_level(logging.WARNING):
+            pickle.dumps(otel)  # nosec
+            pickle.dumps(otel)  # nosec
+
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "OtelExtender" in r.message]
+        tracer_provider_warnings = [r for r in warning_records if "tracer_provider" in r.message]
+        assert len(tracer_provider_warnings) == 1, tracer_provider_warnings
+
+    def test_pickling_with_use_sdk_defaults_and_injected_provider_does_not_warn_about_tracer_provider(
+        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """With a supported fallback (the ambient provider) available, dropping the injected provider
+        across pickling is not worth warning about."""
+        provider, _ = otel_capture
+        otel = OtelExtender(tracer_provider=provider, use_sdk_defaults=True)
+
+        with caplog.at_level(logging.WARNING):
+            pickle.dumps(otel)  # nosec
+
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert not any("tracer_provider" in message for message in warnings), warnings
+
+
+class TestOtelExtenderInProcessIdentityPreservation:
+    """Core's CfwManager never round-trips extenders through a pickling proxy for SYNC/THREADING (no
+    real subprocess involved), so an injected tracer_provider must resolve identity-intact."""
+
+    @pytest.mark.parametrize("mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING])
+    def test_run_all_resolves_the_exact_injected_tracer_provider_object(
+        self,
+        otel_capture: tuple[TracerProvider, InMemorySpanExporter],
+        monkeypatch: pytest.MonkeyPatch,
+        mode: ParallelizationMode,
+    ) -> None:
+        provider, exporter = otel_capture
+        resolved_provider_ids: list[int] = []
+        original_resolve = OtelExtender._resolve_tracer_provider
+
+        def spying_resolve(self: OtelExtender) -> ApiTracerProvider | None:
+            resolved = original_resolve(self)
+            resolved_provider_ids.append(id(resolved))
+            return resolved
+
+        monkeypatch.setattr(OtelExtender, "_resolve_tracer_provider", spying_resolve)
+
+        values = run_value_int(OtelExtender(tracer_provider=provider), parallelization_modes={mode})
+
+        assert values == expected_value_int()
+        assert resolved_provider_ids, "OtelExtender._resolve_tracer_provider was never invoked"
+        assert all(resolved_id == id(provider) for resolved_id in resolved_provider_ids), (
+            "a worker-side OtelExtender resolved a different tracer_provider object than the injected one"
+        )
+        assert len(exporter.get_finished_spans()) >= 1
 
 
 class TestOtelExtenderSpanAttributes:

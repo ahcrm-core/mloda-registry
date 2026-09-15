@@ -46,6 +46,27 @@ class RecordingTransport(Transport):
         return True
 
 
+class _SharedCaptureTransport(RecordingTransport):
+    """Records into class state so a transport rebuilt by unpickling still appends to the list
+    `injected_sink_capture()` returns."""
+
+    kind = "shared-capture"
+    captured: list[RunEvent] = []
+
+    def emit(self, event: Event) -> None:
+        if not isinstance(event, RunEvent):
+            raise TypeError(f"_SharedCaptureTransport only records RunEvent, got {type(event).__name__}")
+        type(self).captured.append(event)
+
+
+@contextmanager
+def _injected_sink_capture() -> Iterator[list[Any]]:
+    """Every RecordingTransport built by make_recording_client() during this context is a _SharedCaptureTransport."""
+    _SharedCaptureTransport.captured = []
+    with patch("mloda.testing.extenders.openlineage.RecordingTransport", _SharedCaptureTransport):
+        yield _SharedCaptureTransport.captured
+
+
 def make_recording_client() -> tuple[OpenLineageClient, RecordingTransport]:
     """An OpenLineageClient wired to a fresh RecordingTransport. OPENLINEAGE_DISABLED and any
     config-file or env-declared filters are cleared for the constructor call, since
@@ -119,6 +140,13 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
 
     def sink_resolution_spy(self) -> AbstractContextManager[list[Any]]:
         return _client_init_resolution_spy()
+
+    @classmethod
+    def supports_pickled_sink_capture(cls) -> bool:
+        return True
+
+    def injected_sink_capture(self) -> AbstractContextManager[list[Any]]:
+        return _injected_sink_capture()
 
     def make_injected_and_sdk_defaults_extender(self) -> Extender:
         client, _ = make_recording_client()

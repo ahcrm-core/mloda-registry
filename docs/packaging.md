@@ -122,14 +122,14 @@ together via `mloda-community[all]`), and its manifest must import cleanly witho
 dependency installed so entry-point loading of the rest of the bundle stays intact.
 
 Moving a dependency behind an extra changes existing installs: when the dependency is missing,
-the manifest logs a record at INFO level naming the extra, and discovery skips the extender
-instead of registering it. Importing the extender name from the package still raises
-`ImportError` naming the extra.
+PluginLoader skips the entry point with a WARNING, and discovery never registers the extender.
+A direct import of the manifest module now raises instead of degrading.
 
-When the dependency is missing, the package module's `__getattr__` raises `ImportError` for the
-extender name, so `hasattr(pkg, "OtelExtender")` raises rather than returning `False`. Code that
-wants to probe availability should check `"OtelExtender" in vars(pkg)` or catch `ImportError`
-around the import.
+When the dependency is missing, accessing the extender name on the package (`OtelExtender`,
+`OpenLineageExtender`) raises `ModuleNotFoundError` through the package's lazy `__getattr__`, so
+`hasattr(pkg, "OtelExtender")` raises rather than returning `False`. Probe availability with
+`importlib.util.find_spec("opentelemetry.trace")` or `find_spec("openlineage.client")` instead,
+since both are namespace packages and a root-only probe can miss a missing submodule.
 
 ### Individual packages
 
@@ -177,6 +177,7 @@ under a per-group attribute:
 | `mloda.feature_groups` | `FEATURE_GROUPS` | `FeatureGroup` |
 | `mloda.compute_frameworks` | `COMPUTE_FRAMEWORKS` | `ComputeFramework` |
 | `mloda.extenders` | `EXTENDERS` | `Extender` |
+| `mloda.optional_dependencies` | `OPTIONAL_DEPENDENCIES` | n/a (tuple of import roots) |
 
 Conventions:
 
@@ -189,6 +190,12 @@ Conventions:
   `mloda-community-ffill = "mloda.community.feature_groups.data_operations.row_preserving.ffill.manifest:FEATURE_GROUPS"`.
 - Bundle packages set `entry_point_bundle = true` and aggregate the entry points of
   every nested plugin package under their path.
+- `mloda.optional_dependencies` is a companion marker group, not a plugin group: it
+  declares a package's optional import roots for `PluginLoader` to consult when the
+  manifest import fails. Its target is the sibling `_optional_dependencies.py`, not
+  `manifest.py`, because the loader reads it only after that import has failed. The
+  package `__init__.py` therefore imports nothing from the optional dependency (both
+  extender packages re-export their extender lazily through a module `__getattr__`).
 
 ## UV workspace sources
 

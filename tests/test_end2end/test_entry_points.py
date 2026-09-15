@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import importlib
 import inspect
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,26 +30,13 @@ else:
     import tomli as tomllib  # type: ignore[import-not-found,unused-ignore]
 
 import pytest
-from mloda.provider import ComputeFramework, FeatureGroup
-from mloda.steward import Extender
+from mloda.core.abstract_plugins.plugin_loader.plugin_loader import ENTRY_POINT_GROUPS
 
 from tests.script_loader import load_script
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _GEN_PATH = _REPO_ROOT / "scripts" / "generate_pyproject.py"
 _VERIFY_BUILDS_PATH = _REPO_ROOT / "scripts" / "verify_builds.py"
-
-# The three valid entry-point groups mapped to (manifest attribute, base type).
-_GROUP_INFO: dict[str, tuple[str, type]] = {
-    "mloda.feature_groups": ("FEATURE_GROUPS", FeatureGroup),
-    "mloda.compute_frameworks": ("COMPUTE_FRAMEWORKS", ComputeFramework),
-    "mloda.extenders": ("EXTENDERS", Extender),
-}
-
-_VALUE_PATTERN = re.compile(
-    r"^(mloda\.community\.|mloda\.enterprise\.).*\.manifest:(FEATURE_GROUPS|COMPUTE_FRAMEWORKS|EXTENDERS)$"
-)
-
 
 gen = load_script("generate_pyproject", _GEN_PATH)
 vb = load_script("verify_builds", _VERIFY_BUILDS_PATH)
@@ -148,7 +134,7 @@ def test_non_plugin_packages_have_no_entry_points(pkg_name: str) -> None:
 
 
 def test_all_entry_point_values_are_namespaced_manifests() -> None:
-    """Every emitted entry-point target must be a namespaced ``.manifest:<ATTR>`` value."""
+    """Every emitted entry-point target must be a namespaced manifest value valid for its own group."""
     shared, packages_config = gen.load_configs()
     packages: dict[str, dict[str, Any]] = packages_config["packages"]
 
@@ -159,11 +145,9 @@ def test_all_entry_point_values_are_namespaced_manifests() -> None:
         if not entry_points:
             continue
         for group, mapping in entry_points.items():
-            assert group in _GROUP_INFO, f"{pkg_name}: unexpected entry-point group {group!r}"
             for name, value in mapping.items():
-                assert _VALUE_PATTERN.match(value), (
-                    f"{pkg_name}: entry point {name!r} in group {group!r} has non-namespaced-manifest value {value!r}"
-                )
+                error = vb.namespaced_entry_point_error(group, name, value)
+                assert error is None, f"{pkg_name}: entry point {name!r} in group {group!r} is invalid: {error}"
 
 
 def _plugin_packages() -> list[tuple[str, dict[str, Any]]]:
@@ -184,8 +168,11 @@ def test_manifest_modules_list_only_concrete_plugins() -> None:
         module = importlib.import_module(manifest_name)
 
         for group in pkg_config["entry_point_groups"]:
-            assert group in _GROUP_INFO, f"{pkg_name}: unexpected entry-point group {group!r}"
-            attr_name, base_type = _GROUP_INFO[group]
+            if group == gen.OPTIONAL_DEPENDENCIES_GROUP:
+                continue
+            assert group in ENTRY_POINT_GROUPS, f"{pkg_name}: unexpected entry-point group {group!r}"
+            attr_name = gen.ENTRY_POINT_ATTRS[group]
+            base_type = ENTRY_POINT_GROUPS[group]
             assert hasattr(module, attr_name), f"{manifest_name}: missing attribute {attr_name}"
             plugins = getattr(module, attr_name)
 
@@ -216,6 +203,25 @@ def test_bundle_and_groups_are_mutually_exclusive() -> None:
         gen.compute_entry_points("mloda-bogus", pkg_config, all_packages)
 
 
+def test_optional_dependencies_entry_point_targets_sibling_marker_module() -> None:
+    """The marker targets ``_optional_dependencies.py``, never ``manifest.py`` (read only after that import fails)."""
+    pkg_config: dict[str, Any] = {
+        "path": "mloda/community/extenders/openlineage",
+        "entry_point_groups": ["mloda.extenders", "mloda.optional_dependencies"],
+    }
+    all_packages: dict[str, dict[str, Any]] = {"mloda-community-openlineage": pkg_config}
+
+    entry_points = gen.compute_entry_points("mloda-community-openlineage", pkg_config, all_packages)
+
+    assert "mloda.optional_dependencies" in entry_points
+    [(label, value)] = entry_points["mloda.optional_dependencies"]
+    assert label == "mloda-community-openlineage"
+    assert value == "mloda.community.extenders.openlineage._optional_dependencies:OPTIONAL_DEPENDENCIES"
+    assert not value.startswith("mloda.community.extenders.openlineage.manifest:"), (
+        "OPTIONAL_DEPENDENCIES must not live in manifest.py"
+    )
+
+
 def test_verify_builds_namespace_helper() -> None:
     """verify_builds must expose namespaced_entry_point_error validating entry-point targets."""
     helper = getattr(vb, "namespaced_entry_point_error", None)
@@ -241,3 +247,53 @@ def test_verify_builds_namespace_helper() -> None:
 
     # Attribute not one of the three allowed -> error.
     assert helper("mloda.feature_groups", "mloda-community-foo", "mloda.community.foo.manifest:PLUGINS") is not None
+
+
+def test_verify_builds_accepts_optional_dependencies_marker_target() -> None:
+    """The marker group's ``._optional_dependencies:OPTIONAL_DEPENDENCIES`` target must pass verification."""
+    assert (
+        vb.namespaced_entry_point_error(
+            "mloda.optional_dependencies",
+            "mloda-community-openlineage",
+            "mloda.community.extenders.openlineage._optional_dependencies:OPTIONAL_DEPENDENCIES",
+        )
+        is None
+    )
+
+
+def test_verify_builds_accepts_extenders_manifest_target() -> None:
+    """The mloda.extenders group's own ``.manifest:EXTENDERS`` pairing must still pass verification."""
+    assert (
+        vb.namespaced_entry_point_error(
+            "mloda.extenders",
+            "mloda-community-extenders-example",
+            "mloda.community.extenders.example.manifest:EXTENDERS",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("group", "value"),
+    [
+        pytest.param(
+            "mloda.optional_dependencies",
+            "mloda.community.foo.manifest:OPTIONAL_DEPENDENCIES",
+            id="optional_dependencies_group_targets_manifest_module",
+        ),
+        pytest.param(
+            "mloda.extenders",
+            "mloda.community.foo._optional_dependencies:EXTENDERS",
+            id="extenders_group_targets_optional_dependencies_module",
+        ),
+        pytest.param(
+            "mloda.extenders",
+            "mloda.community.foo.manifest:OPTIONAL_DEPENDENCIES",
+            id="extenders_group_resolves_to_optional_dependencies_attr",
+        ),
+    ],
+)
+def test_verify_builds_rejects_group_suffix_attr_mismatch(group: str, value: str) -> None:
+    """A group's entry point must match its own (suffix, attr) pairing, not a mix of two groups' halves."""
+    error = vb.namespaced_entry_point_error(group, "some-label", value)
+    assert error is not None, f"{group} -> {value!r} must be rejected"

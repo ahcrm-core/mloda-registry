@@ -101,6 +101,7 @@ class OtelExtenderTestMixin(ExtenderContractTestMixin):
     def sink_resolution_spy(self) -> AbstractContextManager[list[Any]]:
         return _tracer_provider_resolution_spy()
 
+    # No injected_sink_capture()/supports_pickled_sink_capture() override: a TracerProvider never survives pickling.
     def make_injected_and_sdk_defaults_extender(self) -> Extender:
         provider, _ = make_span_capture()
         return self.extender_class()(tracer_provider=provider, use_sdk_defaults=True)  # type: ignore[call-arg]

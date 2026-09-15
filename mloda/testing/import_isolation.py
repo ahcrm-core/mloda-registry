@@ -37,6 +37,21 @@ def _sibling_submodule_names(parent_name: str) -> set[str]:
     return names
 
 
+def evict_root(monkeypatch: pytest.MonkeyPatch, root: str) -> None:
+    """Cold-evict every sys.modules entry at or under ``root``, forcing a genuine cold re-import
+    (unlike ``block_root``, which poisons entries to raise ModuleNotFoundError instead).
+
+    Used to simulate ``root`` being installed but missing one of its own transitive dependencies:
+    the caller poisons that dependency's sys.modules entry separately, then this forces ``root`` to
+    re-execute its own import machinery and hit that poison. The setitem-then-delitem dance restores
+    the pre-test module object on teardown even if the re-import rebinds the name to a new one.
+    """
+    for name in list(sys.modules):
+        if name == root or name.startswith(f"{root}."):
+            monkeypatch.setitem(sys.modules, name, sys.modules[name])
+            monkeypatch.delitem(sys.modules, name)
+
+
 def evict_package(monkeypatch: pytest.MonkeyPatch, dotted: str) -> None:
     """Cold-evict ``dotted`` (and its manifest) from sys.modules and detach it from its parent package.
 
@@ -51,10 +66,7 @@ def evict_package(monkeypatch: pytest.MonkeyPatch, dotted: str) -> None:
         monkeypatch.setattr(parent, leaf, None, raising=False)
         monkeypatch.delattr(parent, leaf, raising=False)
 
-    for name in list(sys.modules):
-        if name == dotted or name.startswith(f"{dotted}."):
-            monkeypatch.setitem(sys.modules, name, sys.modules[name])
-            monkeypatch.delitem(sys.modules, name)
+    evict_root(monkeypatch, dotted)
 
     candidates = (
         {dotted, f"{dotted}.manifest"} | _sibling_submodule_names(parent_name) | _sibling_submodule_names(dotted)

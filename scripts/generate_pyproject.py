@@ -44,14 +44,28 @@ SIBLING_FLOOR_RE = re.compile(r"^\s*[A-Za-z0-9][A-Za-z0-9._-]*\s*(?:\[[^\]]*\])?
 # A bare sibling requirement: just the name (and optional extras), no specifier at all.
 BARE_SIBLING_RE = re.compile(r"^\s*[A-Za-z0-9][A-Za-z0-9._-]*\s*(?:\[[^\]]*\])?\s*$")
 
+# Companion marker group (not a plugin-type group): declares a package's optional import roots for
+# PluginLoader instead of listing plugin classes; not a valid load_entry_points(group=...) argument.
+OPTIONAL_DEPENDENCIES_GROUP = "mloda.optional_dependencies"
+
+# Default entry-point target module suffix, exposed once so other scripts never hand-write the literal.
+DEFAULT_MODULE_SUFFIX = "manifest"
+
 # Entry-point group -> manifest attribute exposing the concrete plugin classes.
-# mloda 0.9.0 discovers installed plugins through these entry-point groups; each
+# mloda discovers installed plugins through these entry-point groups; each
 # plugin package ships a ``manifest.py`` listing its concrete plugin classes
-# under the mapped attribute. See issue #271.
+# under the mapped attribute.
 ENTRY_POINT_ATTRS = {
     "mloda.feature_groups": "FEATURE_GROUPS",
     "mloda.compute_frameworks": "COMPUTE_FRAMEWORKS",
     "mloda.extenders": "EXTENDERS",
+    OPTIONAL_DEPENDENCIES_GROUP: "OPTIONAL_DEPENDENCIES",
+}
+
+# Entry-point group -> target module suffix, default DEFAULT_MODULE_SUFFIX. The optional-dependencies
+# marker targets a sibling module that must import cleanly without the optional dependency.
+ENTRY_POINT_MODULE_SUFFIX: dict[str, str] = {
+    OPTIONAL_DEPENDENCIES_GROUP: "_optional_dependencies",
 }
 
 
@@ -164,7 +178,8 @@ def compute_entry_points(
     """Compute entry-point tables for a package.
 
     Returns a mapping of entry-point group -> sorted list of ``(label, value)``
-    pairs, where ``value`` is the canonical ``<dotted>.manifest:<ATTR>`` target.
+    pairs, where ``value`` is the canonical ``<dotted>.<module_suffix>:<ATTR>`` target
+    (``module_suffix`` per ``ENTRY_POINT_MODULE_SUFFIX``, default ``manifest``).
 
     Bundle packages (``entry_point_bundle = true``) aggregate the entry points of
     every nested plugin package whose path lives under the bundle path. Regular
@@ -182,11 +197,13 @@ def compute_entry_points(
             if not groups:
                 continue
             for group in groups:
-                value = f"{cfg['path'].replace('/', '.')}.manifest:{ENTRY_POINT_ATTRS[group]}"
+                module_suffix = ENTRY_POINT_MODULE_SUFFIX.get(group, DEFAULT_MODULE_SUFFIX)
+                value = f"{cfg['path'].replace('/', '.')}.{module_suffix}:{ENTRY_POINT_ATTRS[group]}"
                 result.setdefault(group, []).append((name, value))
     else:
         for group in pkg_config.get("entry_point_groups", []):
-            value = f"{pkg_config['path'].replace('/', '.')}.manifest:{ENTRY_POINT_ATTRS[group]}"
+            module_suffix = ENTRY_POINT_MODULE_SUFFIX.get(group, DEFAULT_MODULE_SUFFIX)
+            value = f"{pkg_config['path'].replace('/', '.')}.{module_suffix}:{ENTRY_POINT_ATTRS[group]}"
             result.setdefault(group, []).append((pkg_name, value))
 
     return {group: sorted(pairs, key=lambda pair: pair[0]) for group, pairs in result.items() if pairs}

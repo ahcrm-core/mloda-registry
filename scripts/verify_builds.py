@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import configparser
 import re
+import runpy
 import shutil
 import subprocess  # nosec
 import sys
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 if sys.version_info >= (3, 11):
@@ -21,8 +24,18 @@ else:
 CONFIG_DIR = Path("config")
 PACKAGES_CONFIG = CONFIG_DIR / "packages.toml"
 
-# Valid manifest attributes for the mloda plugin entry-point groups (issue #271).
-_VALID_ENTRY_POINT_ATTRS = {"FEATURE_GROUPS", "COMPUTE_FRAMEWORKS", "EXTENDERS"}
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+
+# Not a plain import: this script is also loaded by file path in tests, where scripts/ is not on sys.path.
+_load_sibling: Callable[[str], ModuleType] = runpy.run_path(str(_SCRIPTS_DIR / "script_loader.py"))["load_sibling"]
+gen = _load_sibling("generate_pyproject")
+
+# Each entry-point group's own (module suffix, attribute) pairing, derived from generate_pyproject's
+# own tables so the two scripts never drift apart.
+_ENTRY_POINT_GROUP_SHAPE: dict[str, tuple[str, str]] = {
+    group: (f".{gen.ENTRY_POINT_MODULE_SUFFIX.get(group, gen.DEFAULT_MODULE_SUFFIX)}", attr)
+    for group, attr in gen.ENTRY_POINT_ATTRS.items()
+}
 
 
 def load_packages_config() -> dict[str, dict[str, Any]]:
@@ -65,11 +78,17 @@ def namespaced_entry_point_error(group: str, name: str, value: str) -> str | Non
             "'mloda.community.' or 'mloda.enterprise.' namespace"
         )
 
-    if not module.endswith(".manifest"):
-        return f"{group}: entry point {name!r} module {module!r} does not end with '.manifest'"
+    shape = _ENTRY_POINT_GROUP_SHAPE.get(group)
+    if shape is None:
+        return f"{group}: entry point {name!r} is not a recognized mloda entry-point group"
 
-    if attr not in _VALID_ENTRY_POINT_ATTRS:
-        return f"{group}: entry point {name!r} attribute {attr!r} is not one of {sorted(_VALID_ENTRY_POINT_ATTRS)}"
+    module_suffix, expected_attr = shape
+
+    if not module.endswith(module_suffix):
+        return f"{group}: entry point {name!r} module {module!r} does not end with {module_suffix!r}"
+
+    if attr != expected_attr:
+        return f"{group}: entry point {name!r} attribute {attr!r} is not {expected_attr!r}"
 
     return None
 

@@ -6,7 +6,9 @@ import atexit
 import contextvars
 import logging
 import threading
+import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -37,12 +39,40 @@ _open_invocations: contextvars.ContextVar[tuple[tuple[int, "_OpenCalculateInvoca
 )
 
 
+@dataclass
+class _CloseState:
+    """Close state for one client: shared by client identity for an injected client, private for a
+    self-built one. `client` pins the id while a registry entry lives."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False
+    result: bool | None = None
+    client: OpenLineageClient | None = None
+
+
+# Process-local, keyed by client identity; values are weak so a closed client is released with
+# its last extender.
+_shared_close_registry_lock = threading.Lock()
+_shared_close_registry: weakref.WeakValueDictionary[int, _CloseState] = weakref.WeakValueDictionary()
+
+
+def _get_or_create_close_state(client: OpenLineageClient) -> _CloseState:
+    key = id(client)
+    with _shared_close_registry_lock:
+        state = _shared_close_registry.get(key)
+        if state is None:
+            state = _CloseState(client=client)
+            _shared_close_registry[key] = state
+        return state
+
+
 class OpenLineageExtender(Extender):
     """Emits one OpenLineage START/COMPLETE|FAIL|ABORT RunEvent per calculate invocation, correlating nested
     INPUT_DATA_LOAD calls as inputs. Sink resolution: injected client wins, else use_sdk_defaults, else inert.
     Emits happen synchronously on the calculation thread, so a blocking transport delays every wrapped calculation.
-    close() flushes the client and is terminal; a self-built client also gets a bounded-timeout atexit flush
-    (main process only, not MULTIPROCESSING workers)."""
+    close() flushes the client and is terminal. A self-built client is rebuilt per worker; an injected client
+    is pickled as-is and must be picklable under MULTIPROCESSING. Workers are terminated without a flush, so
+    a synchronous transport is needed there."""
 
     _ATEXIT_CLOSE_TIMEOUT = 10.0
 
@@ -64,9 +94,13 @@ class OpenLineageExtender(Extender):
         self._client_lock = threading.Lock()
         self._closed = False
         self._logged_inert = False
+        # Determined by whether a client was injected, not by when the lazy build happens to run.
+        self._owns_client = client is None
+        # Registry entry if injected, else a private state created upfront for the lazy build.
+        self._close_state = _get_or_create_close_state(client) if client is not None else _CloseState()
 
     def _get_client(self) -> OpenLineageClient | None:
-        if self._closed:
+        if self._closed or self._close_state.closed:
             raise RuntimeError(f"{type(self).__name__} was closed; it can no longer be used to emit OpenLineage events")
         if self._client is not None:
             return self._client
@@ -79,19 +113,41 @@ class OpenLineageExtender(Extender):
         return self._client
 
     def close(self, timeout: float = -1.0) -> bool:
-        """Flush the underlying client. A no-op returning True if no client has been built yet, or if
-        already closed. Idempotent: only the first call actually flushes; subsequent calls are no-ops."""
+        """Flush the underlying client; a no-op if none has been built yet, waiting out any build in
+        flight. Otherwise every closer, including a sibling sharing an injected client, waits for one flush."""
         with self._client_lock:
-            if self._client is None or self._closed:
+            if self._client is None:
                 return True
-            self._closed = True
-            atexit.unregister(self.close)
             client = self._client
+            state = self._close_state
+            if not self._closed:
+                self._closed = True
+                atexit.unregister(self.close)
+            state.closed = True
 
-        flushed = client.close(timeout)
-        if not flushed:
-            logger.warning("%s failed to flush all events within timeout", type(self).__name__)
-        return flushed
+        remaining = timeout
+        if timeout < 0:
+            acquired = state.lock.acquire(timeout=-1)
+        else:
+            # Probe first so an uncontended close passes the caller's timeout to the flush unchanged.
+            acquired = state.lock.acquire(timeout=0)
+            if not acquired:
+                started = time.monotonic()
+                acquired = state.lock.acquire(timeout=timeout)
+                if acquired:
+                    remaining = max(0.0, timeout - (time.monotonic() - started))
+        if not acquired:
+            return False
+        try:
+            result = state.result
+            if result is None:
+                result = client.close(remaining)
+                if not result:
+                    logger.warning("%s failed to flush all events within timeout", type(self).__name__)
+                state.result = result
+            return result
+        finally:
+            state.lock.release()
 
     def _emit(self, event: RunEvent) -> None:
         client = self._get_client()
@@ -101,14 +157,18 @@ class OpenLineageExtender(Extender):
 
     def __getstate__(self) -> dict[str, Any]:
         state = dict(self.__dict__)
-        state["_client"] = None
+        if self._owns_client:
+            # _owns_client keeps meaning "no client was injected" after unpickling too.
+            state["_client"] = None
         state["_logged_inert"] = False
         del state["_client_lock"]
+        del state["_close_state"]
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._client_lock = threading.Lock()
+        self._close_state = _get_or_create_close_state(self._client) if self._client is not None else _CloseState()
 
     def wraps(self) -> set[ExtenderHook]:
         return {

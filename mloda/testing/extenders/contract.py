@@ -73,6 +73,15 @@ class ExtenderContractTestMixin:
     def sink_resolution_spy(self) -> AbstractContextManager[list[Any]]:
         raise NotImplementedError
 
+    @classmethod
+    def supports_pickled_sink_capture(cls) -> bool:
+        """False unless the host's injected sink survives pickling (OpenLineage does; an OTel TracerProvider never can)."""
+        return False
+
+    def injected_sink_capture(self) -> AbstractContextManager[list[Any]]:
+        """Context yielding a list of what a picklable, injected sink actually received after the pickle round trip."""
+        raise NotImplementedError
+
     def context_hook(self) -> ExtenderHook:
         """FEATURE_GROUP_CALCULATE_FEATURE when wrapped, else the wrapped hook with the smallest value."""
         wraps = self.make_extender().wraps()
@@ -185,6 +194,16 @@ class ExtenderContractTestMixin:
         with self.pickled_copy_environment():
             with make_hook_context(hook=self.context_hook()).activate():
                 assert copy(lambda a, b: a + b, 3, 4) == 7
+
+    def test_contract_pickled_copy_with_picklable_sink_still_emits(self) -> None:
+        if not self.supports_pickled_sink_capture():
+            pytest.skip("host does not support pickled-sink capture")
+        with self.injected_sink_capture() as captured:
+            copy = pickle.loads(pickle.dumps(self.make_extender()))  # nosec
+            with self.pickled_copy_environment():
+                with make_hook_context(hook=self.context_hook()).activate():
+                    assert copy(lambda a, b: a + b, 3, 4) == 7
+            assert captured  # the pickled copy actually emitted into the shared/captured sink
 
     def test_contract_own_failure_does_not_stop_chained_extender(self, caplog: pytest.LogCaptureFixture) -> None:
         if not self.supports_warning_only():

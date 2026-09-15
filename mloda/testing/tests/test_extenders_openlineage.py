@@ -64,7 +64,6 @@ class _ProbeOpenLineageExtender(Extender):
 
     def __getstate__(self) -> dict[str, Any]:
         state = dict(self.__dict__)
-        state["_client"] = None
         state["_open_inputs"] = None
         return state
 

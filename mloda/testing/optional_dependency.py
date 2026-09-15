@@ -3,25 +3,25 @@
 from __future__ import annotations
 
 import importlib
-import logging
 import sys
+from typing import Any
 
 import pytest
+from mloda.user import PluginLoader
 
 from mloda.testing.import_isolation import block_root, evict_package
 
 
 class OptionalDependencyPackageTestMixin:
-    """Manifest resilience contract. Host declares package, root, distribution, extra, extender_name,
-    extender_module: mloda's entry-point loader only tolerates a missing ``root`` (the manifest degrades
-    to an empty EXTENDERS list), while any other import error must still propagate."""
+    """Host declares package, root, extender_name, extender_module, api_module. The manifest never swallows a
+    missing ``root`` (PluginLoader is the sole guard), and the package re-exports its extender lazily, so
+    importing the package itself needs no dependency."""
 
     package: str
     root: str
-    distribution: str
-    extra: str
     extender_name: str
     extender_module: str
+    api_module: str
 
     def test_manifest_lists_the_extender_when_installed(self) -> None:
         manifest = importlib.import_module(f"{self.package}.manifest")
@@ -30,17 +30,10 @@ class OptionalDependencyPackageTestMixin:
 
         assert manifest.EXTENDERS == [extender]
 
-    def test_manifest_is_empty_when_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_manifest_raises_when_dependency_is_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A direct manifest import with ``root`` missing raises; the skip-and-warn lives in PluginLoader."""
         block_root(monkeypatch, self.root)
         evict_package(monkeypatch, self.package)
-
-        module = importlib.import_module(f"{self.package}.manifest")
-
-        assert module.EXTENDERS == []
-
-    def test_manifest_reraises_unrelated_import_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setitem(sys.modules, f"{self.package}.{self.extender_module}", None)
-        monkeypatch.delitem(sys.modules, f"{self.package}.manifest", raising=False)
 
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(f"{self.package}.manifest")
@@ -53,72 +46,64 @@ class OptionalDependencyPackageTestMixin:
 
         assert self.extender_name not in vars(module)
 
-        with pytest.raises(ImportError):
+        with pytest.raises(ModuleNotFoundError):
             getattr(module, self.extender_name)
 
-    def test_missing_dependency_import_error_names_distribution_and_extra(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        block_root(monkeypatch, self.root)
-        evict_package(monkeypatch, self.package)
-
-        with pytest.raises(ImportError) as info:
-            getattr(importlib.import_module(self.package), self.extender_name)
-
-        assert self.distribution in str(info.value)
-        assert self.extra in str(info.value)
-
-        module = importlib.import_module(self.package)
         assert getattr(module, "some_other_name", None) is None
 
-    def test_manifest_logs_when_dependency_is_missing(
-        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    def test_package_import_does_not_import_the_extender_module(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The package re-exports lazily: only the first attribute access imports the extender module."""
+        evict_package(monkeypatch, self.package)
+        extender_module_name = f"{self.package}.{self.extender_module}"
+
+        module = importlib.import_module(self.package)
+
+        assert extender_module_name not in sys.modules
+
+        extender = getattr(module, self.extender_name)
+
+        assert extender_module_name in sys.modules
+        assert extender is getattr(sys.modules[extender_module_name], self.extender_name)
+
+    def test_star_import_without_dependency_succeeds_and_binds_no_extender(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A star import must not blow up just because the optional dependency is missing."""
         block_root(monkeypatch, self.root)
         evict_package(monkeypatch, self.package)
 
-        with caplog.at_level(logging.INFO):
-            importlib.import_module(f"{self.package}.manifest")
+        module = importlib.import_module(self.package)
+        namespace: dict[str, Any] = {name: getattr(module, name) for name in module.__all__}
 
-        matching = [
-            record
-            for record in caplog.records
-            if record.name.startswith("mloda.community.extenders.")
-            and record.levelno >= logging.INFO
-            and self.extra in record.getMessage()
-        ]
-        assert matching, f"no INFO log named the {self.extra} extra"
+        assert self.extender_name not in namespace
 
-    def test_blocking_tests_leave_no_degraded_module_behind(self) -> None:
-        """A prior test blocking the dependency must not leak its degraded module into later imports."""
-        root_package = "mloda.community.extenders"
-        leaf_attr = self.package.rsplit(".", 1)[1]
-        manifest_name = f"{self.package}.manifest"
+    def test_star_import_with_only_api_module_blocked_succeeds_and_binds_no_extender(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A partial namespace install, where the namespace root imports but the submodule the extender
+        actually uses does not, must still be treated as the dependency being unavailable."""
+        block_root(monkeypatch, self.api_module)
+        evict_package(monkeypatch, self.package)
 
-        if self.package not in sys.modules:
-            importlib.import_module(self.package)
+        module = importlib.import_module(self.package)
+        namespace: dict[str, Any] = {name: getattr(module, name) for name in module.__all__}
 
-        with pytest.MonkeyPatch.context() as pre_mp:
-            if manifest_name in sys.modules:
-                pre_mp.delitem(sys.modules, manifest_name)
+        assert self.extender_name not in namespace
 
-            before_package = sys.modules.get(self.package)
-            before_manifest = sys.modules.get(manifest_name)
+    def test_star_import_all_lists_extender_when_dependency_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """__all__ must only promise the extender name when the dependency import can actually succeed."""
+        evict_package(monkeypatch, self.package)
 
-            with pytest.MonkeyPatch.context() as mp:
-                block_root(mp, self.root)
-                evict_package(mp, self.package)
-                importlib.import_module(manifest_name)
+        module = importlib.import_module(self.package)
 
-            assert sys.modules.get(manifest_name) is before_manifest
-            assert sys.modules.get(self.package) is before_package
+        assert self.extender_name in module.__all__
 
-            extender_module = importlib.import_module(f"{self.package}.{self.extender_module}")
-            extender = getattr(extender_module, self.extender_name)
+    def test_plugin_loader_reraises_unrelated_import_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A poisoned extender submodule, unrelated to the optional dependency, is never swallowed."""
+        evict_package(monkeypatch, self.package)
+        monkeypatch.setitem(sys.modules, f"{self.package}.{self.extender_module}", None)
 
-            module = importlib.import_module(manifest_name)
-            assert module.EXTENDERS == [extender]
+        with pytest.raises(ImportError) as excinfo:
+            PluginLoader().load_entry_points(group="mloda.extenders")
 
-        restored_leaf = getattr(importlib.import_module(root_package), leaf_attr, None)
-        assert restored_leaf is not None
-        assert hasattr(restored_leaf, self.extender_name)
+        assert excinfo.value.name == f"{self.package}.{self.extender_module}"

@@ -6,6 +6,9 @@ honest: an on-disk import-root sweep, and a cross-check against config/packages.
 from __future__ import annotations
 
 import ast
+import importlib
+import importlib.util
+import logging
 import re
 import sys
 from pathlib import Path
@@ -64,6 +67,41 @@ def test_skips_backend_with_missing_optional_framework(monkeypatch: pytest.Monke
     assert [c.__name__ for c in classes] == ["_KeptClass"]
 
 
+def test_skipping_backend_with_missing_optional_framework_logs_debug_naming_the_backend(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A backend whose framework is simply not installed (ModuleNotFoundError.name matches exactly)
+    is quiet: one DEBUG record naming the backend and the missing dependency, no WARNING."""
+    kept_module = SimpleNamespace(KeptClass=_KeptClass)
+
+    def fake_import(name: str) -> Any:
+        if name.endswith("polars_backend"):
+            raise ModuleNotFoundError("No module named 'polars'", name="polars")
+        return kept_module
+
+    monkeypatch.setattr(_IMPORT_MODULE_TARGET, fake_import)
+
+    with caplog.at_level(logging.DEBUG, logger="mloda.community.feature_groups.data_operations.manifest_utils"):
+        load_plugin_classes(
+            "pkg",
+            [
+                ("polars_backend", "PolarsClass"),
+                ("pandas_backend", "KeptClass"),
+            ],
+        )
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert not warnings, f"expected no WARNING log record, got {warnings}"
+    debugs = [record for record in caplog.records if record.levelno == logging.DEBUG]
+    assert len(debugs) == 1, f"expected exactly one DEBUG log record, got {caplog.records}"
+    message = debugs[0].getMessage()
+    assert "polars_backend" in message, f"log message does not name the skipped backend: {message!r}"
+    assert "polars" in message, f"log message does not name the missing optional dependency: {message!r}"
+    assert getattr(debugs[0], "blamed_dependency", None) == "polars", (
+        f"log record does not carry blamed_dependency='polars': {debugs[0].__dict__}"
+    )
+
+
 def test_skips_backend_with_missing_numpy(monkeypatch: pytest.MonkeyPatch) -> None:
     kept_module = SimpleNamespace(KeptClass=_KeptClass)
 
@@ -95,6 +133,136 @@ def test_reraises_non_optional_module_not_found(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(_IMPORT_MODULE_TARGET, fake_import)
 
     with pytest.raises(ModuleNotFoundError):
+        load_plugin_classes("pkg", [("missing_backend", "MissingClass")])
+
+
+def test_skips_backend_via_traceback_blame_when_transitive_reraise_drops_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A framework re-raising ModuleNotFoundError without ``.name`` needs traceback-frame blame; this
+    installed-but-broken shape is skipped with exactly one WARNING naming backend and dependency."""
+    framework_dir = tmp_path / "regmanifest_casea_framework"
+    framework_dir.mkdir()
+    (framework_dir / "__init__.py").write_text(
+        "raise ModuleNotFoundError('regmanifest_casea_framework failed to import its native extension')\n"
+    )
+
+    backend_pkg_dir = tmp_path / "regmanifest_casea_pkg"
+    backend_pkg_dir.mkdir()
+    (backend_pkg_dir / "__init__.py").write_text("")
+    (backend_pkg_dir / "pandas_backend.py").write_text(
+        "import regmanifest_casea_framework\n\n\nclass PandasClass:\n    pass\n"
+    )
+    (backend_pkg_dir / "polars_backend.py").write_text("class KeptClass:\n    pass\n")
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(
+        manifest_utils,
+        "_OPTIONAL_BACKENDS",
+        manifest_utils._OPTIONAL_BACKENDS | frozenset({"regmanifest_casea_framework"}),
+    )
+    importlib.invalidate_caches()
+
+    with caplog.at_level(logging.DEBUG, logger="mloda.community.feature_groups.data_operations.manifest_utils"):
+        classes = load_plugin_classes(
+            "regmanifest_casea_pkg",
+            [
+                ("pandas_backend", "PandasClass"),
+                ("polars_backend", "KeptClass"),
+            ],
+        )
+
+    assert [c.__name__ for c in classes] == ["KeptClass"]
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one WARNING log record, got {caplog.records}"
+    message = warnings[0].getMessage()
+    assert "pandas_backend" in message, f"log message does not name the skipped backend: {message!r}"
+    assert "regmanifest_casea_framework" in message, f"log message does not name the dependency: {message!r}"
+    assert getattr(warnings[0], "blamed_dependency", None) == "regmanifest_casea_framework", (
+        f"log record does not carry blamed_dependency='regmanifest_casea_framework': {warnings[0].__dict__}"
+    )
+    assert "regmanifest_casea_framework failed to import its native extension" in message, (
+        f"log message does not include the original exception text: {message!r}"
+    )
+    assert "missing" not in message, (
+        f"log message must not say 'missing' for an installed-but-broken backend: {message!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "specs, failing_submodule, exc, expected_dependency",
+    [
+        pytest.param(
+            [("pandas_backend", "PandasClass"), ("polars_backend", "KeptClass")],
+            "pandas_backend",
+            ImportError(
+                "cannot import name 'NewFeature' from 'pandas' (too old)",
+                name="pandas",
+            ),
+            "pandas",
+            id="plain_import_error_too_old_framework",
+        ),
+        pytest.param(
+            [("pandas_backend", "KeptClass"), ("polars_backend", "PolarsClass")],
+            "polars_backend",
+            ModuleNotFoundError("No module named 'polars.selectorz'", name="polars.selectorz"),
+            "polars",
+            id="dotted_name_submodule_not_found",
+        ),
+    ],
+)
+def test_skips_backend_installed_but_broken_logs_warning_naming_the_backend(
+    specs: list[tuple[str, str]],
+    failing_submodule: str,
+    exc: ImportError,
+    expected_dependency: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A too-old framework's plain ImportError and a dotted submodule ModuleNotFoundError are both
+    installed-but-broken shapes: each is skipped with exactly one WARNING naming backend and dependency."""
+    kept_module = SimpleNamespace(KeptClass=_KeptClass)
+
+    def fake_import(name: str) -> Any:
+        if name.endswith(failing_submodule):
+            raise exc
+        return kept_module
+
+    monkeypatch.setattr(_IMPORT_MODULE_TARGET, fake_import)
+
+    with caplog.at_level(logging.DEBUG, logger="mloda.community.feature_groups.data_operations.manifest_utils"):
+        classes = load_plugin_classes("pkg", specs)
+
+    assert [c.__name__ for c in classes] == ["_KeptClass"]
+
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one WARNING log record, got {caplog.records}"
+    message = warnings[0].getMessage()
+    assert failing_submodule in message, f"log message does not name the skipped backend: {message!r}"
+    assert expected_dependency in message, f"log message does not name the dependency: {message!r}"
+    assert getattr(warnings[0], "blamed_dependency", None) == expected_dependency, (
+        f"log record does not carry blamed_dependency={expected_dependency!r}: {warnings[0].__dict__}"
+    )
+    assert str(exc) in message, f"log message does not include the original exception text: {message!r}"
+    assert "missing" not in message, (
+        f"log message must not say 'missing' for an installed-but-broken backend: {message!r}"
+    )
+
+
+def test_reraises_plain_import_error_not_rooted_at_optional_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Catching ImportError instead of only ModuleNotFoundError must not swallow an unrelated
+    first-party ImportError (a real typo stays loud)."""
+
+    def fake_import(name: str) -> ModuleType:
+        raise ImportError(
+            "cannot import name 'RealTypo' from 'mloda.community.foo.bar'",
+            name="mloda.community.foo.bar",
+        )
+
+    monkeypatch.setattr(_IMPORT_MODULE_TARGET, fake_import)
+
+    with pytest.raises(ImportError):
         load_plugin_classes("pkg", [("missing_backend", "MissingClass")])
 
 
@@ -342,3 +510,31 @@ def test_optional_backends_matches_packages_config_declared_frameworks() -> None
         f"Declared optional in config/packages.toml but missing from _OPTIONAL_BACKENDS (add it there so "
         f"its backend is skipped when not installed): {sorted(missing)}."
     )
+
+
+def _manifest_module_names() -> list[str]:
+    """Dotted module names for every manifest.py under the data_operations root."""
+    return sorted(
+        str(path.relative_to(_REPO_ROOT).with_suffix("")).replace("/", ".")
+        for path in _DATA_OPERATIONS_ROOT.rglob("manifest.py")
+    )
+
+
+@pytest.mark.parametrize("module_name", _manifest_module_names())
+def test_reloading_manifest_never_skips_a_backend_whose_framework_is_installed(
+    module_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A backend whose framework is installed must never be skipped, so a typo in a backend import fails here."""
+    module = importlib.import_module(module_name)
+    with caplog.at_level(logging.DEBUG, logger="mloda.community.feature_groups.data_operations.manifest_utils"):
+        importlib.reload(module)
+
+    for record in caplog.records:
+        if record.name != manifest_utils.logger.name:
+            continue
+        root = getattr(record, "blamed_dependency", None)
+        if not isinstance(root, str):
+            continue
+        assert importlib.util.find_spec(root) is None, (
+            f"{module_name}: skipped a backend blaming {root!r}, but {root} is installed ({record.getMessage()})"
+        )
