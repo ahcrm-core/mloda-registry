@@ -30,7 +30,12 @@ from opentelemetry.trace import TracerProvider as ApiTracerProvider
 from mloda.community.extenders.otel import OtelExtender
 from mloda.community.extenders.otel import otel_extender as otel_extender_module
 from mloda.testing.extenders.hook_context import make_hook_context
-from mloda.testing.extenders.otel import OtelExtenderTestMixin, make_span_capture, single_span_attributes
+from mloda.testing.extenders.otel import (
+    OtelExtenderTestMixin,
+    make_picklable_span_capture,
+    make_span_capture,
+    single_span_attributes,
+)
 from mloda.testing.extenders.runners import expected_value_int, run_value_int
 
 # The one attribute key that MUST carry content preview.
@@ -213,25 +218,9 @@ class TestOtelExtenderPickling:
 
         assert len(ambient_exporter.get_finished_spans()) == 1
 
-    def test_injected_provider_drop_warns_once_across_repeated_pickling(
+    def test_pickling_with_use_sdk_defaults_and_injected_unpicklable_provider_still_warns_about_tracer_provider(
         self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], caplog: pytest.LogCaptureFixture
     ) -> None:
-        provider, _ = otel_capture
-        otel = OtelExtender(tracer_provider=provider)
-
-        with caplog.at_level(logging.WARNING):
-            pickle.dumps(otel)  # nosec
-            pickle.dumps(otel)  # nosec
-
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING and "OtelExtender" in r.message]
-        tracer_provider_warnings = [r for r in warning_records if "tracer_provider" in r.message]
-        assert len(tracer_provider_warnings) == 1, tracer_provider_warnings
-
-    def test_pickling_with_use_sdk_defaults_and_injected_provider_does_not_warn_about_tracer_provider(
-        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """With a supported fallback (the ambient provider) available, dropping the injected provider
-        across pickling is not worth warning about."""
         provider, _ = otel_capture
         otel = OtelExtender(tracer_provider=provider, use_sdk_defaults=True)
 
@@ -239,7 +228,25 @@ class TestOtelExtenderPickling:
             pickle.dumps(otel)  # nosec
 
         warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
-        assert not any("tracer_provider" in message for message in warnings), warnings
+        assert any("tracer_provider" in message for message in warnings), warnings
+        # The generic "could not be pickled" sentence alone gives no clue why; the underlying
+        # trial-pickle exception's type name must be present too (pickling the real SDK
+        # TracerProvider's internal threading.Lock always raises TypeError).
+        assert any("TypeError" in message for message in warnings), warnings
+
+    def test_picklable_custom_tracer_provider_survives_pickling_and_does_not_warn(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider, _ = make_picklable_span_capture()
+        otel = OtelExtender(tracer_provider=provider)
+
+        with caplog.at_level(logging.WARNING):
+            copy = pickle.loads(pickle.dumps(otel))  # nosec
+
+        assert copy._tracer_provider is not None
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING and "OtelExtender" in r.message]
+        tracer_provider_warnings = [message for message in warnings if "tracer_provider" in message]
+        assert tracer_provider_warnings == [], tracer_provider_warnings
 
 
 class TestOtelExtenderInProcessIdentityPreservation:
