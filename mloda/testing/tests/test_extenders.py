@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 from mloda.steward import Extender, ExtenderHook, HookContext
+from mloda.user import ParallelizationMode
 
 from mloda.testing.extenders import runners
 from mloda.testing.extenders.contract import ExtenderContractTestMixin
@@ -393,6 +394,58 @@ class TestHasBackendSinkMustBeDeclared:
             _UndeclaredHost().test_contract_unconfigured_extender_emits_nothing()
 
 
+class TestMakeExtenderWithSinkProbeMustBeDeclared:
+    def test_default_raises_not_implemented_error(self) -> None:
+        with pytest.raises(NotImplementedError):
+            ExtenderContractTestMixin().make_extender_with_sink_probe()
+
+    def test_undeclared_host_errors_instead_of_skipping_sink_gated_test(self, caplog: pytest.LogCaptureFixture) -> None:
+        class _UndeclaredHost(ExtenderContractTestMixin):
+            @classmethod
+            def extender_class(cls) -> type[Extender]:
+                return _ProbeExtender
+
+            def make_extender(self, *, raise_on_error: bool | None = None) -> _ProbeExtender:
+                return _ProbeExtender(sink=[])
+
+            @classmethod
+            def has_backend_sink(cls) -> bool:
+                return True
+
+        with pytest.raises(NotImplementedError):
+            _UndeclaredHost().test_contract_run_all_emits_into_the_exact_injected_sink(ParallelizationMode.SYNC, caplog)
+
+
+class TestMakeRealWorkerExtenderAndMarkerMustBeDeclared:
+    def test_default_raises_not_implemented_error(self, tmp_path: Path) -> None:
+        with pytest.raises(NotImplementedError):
+            ExtenderContractTestMixin().make_real_worker_extender_and_marker(tmp_path)
+
+    def test_undeclared_host_errors_instead_of_skipping_sink_gated_test(
+        self, tmp_path: Path, request: pytest.FixtureRequest, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class _UndeclaredHost(ExtenderContractTestMixin):
+            @classmethod
+            def extender_class(cls) -> type[Extender]:
+                return _ProbeExtender
+
+            def make_extender(self, *, raise_on_error: bool | None = None) -> _ProbeExtender:
+                return _ProbeExtender(sink=[])
+
+            @classmethod
+            def has_backend_sink(cls) -> bool:
+                return False
+
+            @classmethod
+            def supports_real_worker_sink(cls) -> bool:
+                return True
+
+        with pytest.raises(NotImplementedError):
+            _UndeclaredHost().test_contract_real_worker_multiprocessing_emits_into_the_exact_injected_sink(
+                tmp_path, request, caplog
+            )
+
+
 class TestCountingExtender:
     """CountingExtender: breaking pass-through probe that counts its own invocations."""
 
@@ -441,6 +494,10 @@ class TestExtenderContractTestMixinShape:
             "test_contract_pickled_copy_still_wraps",
             "test_contract_own_failure_does_not_stop_chained_extender",
             "test_contract_run_all_own_failure_falls_back_when_raise_on_error_false",
+            "test_contract_run_all_emits_into_the_exact_injected_sink",
+            "test_contract_real_worker_multiprocessing_emits_into_the_exact_injected_sink",
+            "test_contract_real_worker_multiprocessing_unpicklable_sink_degrades_gracefully",
+            "test_contract_pickled_copy_with_sdk_defaults_resolves_ambient_sink",
         ],
     )
     def test_new_contract_tests_exist(self, name: str) -> None:

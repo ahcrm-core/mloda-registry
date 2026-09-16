@@ -16,23 +16,20 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from mloda.core.abstract_plugins.hook_context import instrument  # no public equivalent yet
-from mloda.steward import ExtenderHook
-from mloda.user import ParallelizationMode
+from mloda.steward import Extender, ExtenderHook
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
-from opentelemetry.trace import TracerProvider as ApiTracerProvider
 
 from mloda.community.extenders.otel import OtelExtender
 from mloda.community.extenders.otel import otel_extender as otel_extender_module
 from mloda.testing.extenders.hook_context import make_hook_context
 from mloda.testing.extenders.otel import (
     OtelExtenderTestMixin,
-    make_picklable_span_capture,
+    RebuildingSpanCaptureProvider,
     make_span_capture,
     single_span_attributes,
 )
@@ -79,6 +76,16 @@ class TestOtelExtenderContract(OtelExtenderTestMixin):
             ExtenderHook.VALIDATE_INPUT_FEATURE: "mloda.validate.input",
             ExtenderHook.VALIDATE_OUTPUT_FEATURE: "mloda.validate.output",
         }
+
+    @classmethod
+    def supports_real_worker_sink(cls) -> bool:
+        return True
+
+    def make_real_worker_extender_and_marker(self, tmp_path: Path) -> tuple[Extender, Path]:
+        marker_path = tmp_path / "otel_real_worker_spans.txt"
+        provider = RebuildingSpanCaptureProvider(marker_path=marker_path)
+        extender = self.extender_class()(tracer_provider=provider)
+        return extender, marker_path
 
 
 class TestOtelExtenderModuleImports:
@@ -204,20 +211,6 @@ class TestOtelExtenderInertContentCapture:
 
 
 class TestOtelExtenderPickling:
-    def test_pickled_copy_with_sdk_defaults_resolves_ambient_provider(
-        self, otel_capture: tuple[TracerProvider, InMemorySpanExporter]
-    ) -> None:
-        provider, _ = otel_capture
-        otel = OtelExtender(tracer_provider=provider, use_sdk_defaults=True)
-        copy = pickle.loads(pickle.dumps(otel))  # nosec
-
-        ambient_provider, ambient_exporter = make_span_capture()
-        with patch("opentelemetry.trace.get_tracer_provider", return_value=ambient_provider):
-            with make_hook_context().activate():
-                copy(lambda: None)
-
-        assert len(ambient_exporter.get_finished_spans()) == 1
-
     def test_pickling_with_use_sdk_defaults_and_injected_unpicklable_provider_still_warns_about_tracer_provider(
         self, otel_capture: tuple[TracerProvider, InMemorySpanExporter], caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -233,52 +226,6 @@ class TestOtelExtenderPickling:
         # trial-pickle exception's type name must be present too (pickling the real SDK
         # TracerProvider's internal threading.Lock always raises TypeError).
         assert any("TypeError" in message for message in warnings), warnings
-
-    def test_picklable_custom_tracer_provider_survives_pickling_and_does_not_warn(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        provider, _ = make_picklable_span_capture()
-        otel = OtelExtender(tracer_provider=provider)
-
-        with caplog.at_level(logging.WARNING):
-            copy = pickle.loads(pickle.dumps(otel))  # nosec
-
-        assert copy._tracer_provider is not None
-        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING and "OtelExtender" in r.message]
-        tracer_provider_warnings = [message for message in warnings if "tracer_provider" in message]
-        assert tracer_provider_warnings == [], tracer_provider_warnings
-
-
-class TestOtelExtenderInProcessIdentityPreservation:
-    """Core's CfwManager never round-trips extenders through a pickling proxy for SYNC/THREADING (no
-    real subprocess involved), so an injected tracer_provider must resolve identity-intact."""
-
-    @pytest.mark.parametrize("mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING])
-    def test_run_all_resolves_the_exact_injected_tracer_provider_object(
-        self,
-        otel_capture: tuple[TracerProvider, InMemorySpanExporter],
-        monkeypatch: pytest.MonkeyPatch,
-        mode: ParallelizationMode,
-    ) -> None:
-        provider, exporter = otel_capture
-        resolved_provider_ids: list[int] = []
-        original_resolve = OtelExtender._resolve_tracer_provider
-
-        def spying_resolve(self: OtelExtender) -> ApiTracerProvider | None:
-            resolved = original_resolve(self)
-            resolved_provider_ids.append(id(resolved))
-            return resolved
-
-        monkeypatch.setattr(OtelExtender, "_resolve_tracer_provider", spying_resolve)
-
-        values = run_value_int(OtelExtender(tracer_provider=provider), parallelization_modes={mode})
-
-        assert values == expected_value_int()
-        assert resolved_provider_ids, "OtelExtender._resolve_tracer_provider was never invoked"
-        assert all(resolved_id == id(provider) for resolved_id in resolved_provider_ids), (
-            "a worker-side OtelExtender resolved a different tracer_provider object than the injected one"
-        )
-        assert len(exporter.get_finished_spans()) >= 1
 
 
 class TestOtelExtenderSpanAttributes:

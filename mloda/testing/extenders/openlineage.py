@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from typing import Any
@@ -73,6 +73,25 @@ class LockHoldingTransport(Transport):
 
     def emit(self, event: Event) -> None:
         self.events.append(event)
+
+
+class FileTransport(Transport):
+    """Appends one line per emitted event's type to marker_path, so an event can be observed from
+    inside a real spawned worker process."""
+
+    kind = "file-transport"
+    config_class = Config
+
+    def __init__(self, marker_path: Path) -> None:
+        self._marker_path = marker_path
+
+    def emit(self, event: Event) -> None:
+        if not isinstance(event, RunEvent):
+            raise TypeError(f"FileTransport only records RunEvent, got {type(event).__name__}")
+        if event.eventType is None:
+            return
+        with open(self._marker_path, "a") as handle:
+            handle.write(f"{event.eventType.value}\n")
 
 
 @contextmanager
@@ -168,9 +187,23 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
         client, _ = make_recording_client()
         return self.extender_class()(client=client, use_sdk_defaults=True)  # type: ignore[call-arg]
 
+    @classmethod
+    def injected_and_sdk_defaults_sink_survives_pickling(cls) -> bool:
+        """make_recording_client()'s RecordingTransport-backed client is picklable, so the injected
+        client here survives pickling intact and the copy keeps using it directly."""
+        return True
+
     def make_extender(self, *, raise_on_error: bool | None = None) -> Extender:
         client, _ = make_recording_client()
         return self.make_openlineage_extender(client, raise_on_error=raise_on_error)
+
+    def make_extender_with_sink_probe(self) -> tuple[Extender, Callable[[], Any]]:
+        client, transport = make_recording_client()
+        extender = self.make_openlineage_extender(client)
+        return extender, lambda: [event.eventType.value for event in transport.events if event.eventType is not None]
+
+    def sink_probe_expected_content(self) -> set[str] | None:
+        return {"START", "COMPLETE"}
 
     def own_failure(self) -> AbstractContextManager[Any]:
         return patch.object(OpenLineageClient, "emit", side_effect=RuntimeError("openlineage instrumentation boom"))
@@ -182,6 +215,10 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
     @classmethod
     def supports_unpicklable_sink_degrade(cls) -> bool:
         return True
+
+    @classmethod
+    def sink_noun(cls) -> str | None:
+        return "client"
 
     def test_openlineage_no_ambient_context_emits_nothing(self) -> None:
         client, transport = make_recording_client()
