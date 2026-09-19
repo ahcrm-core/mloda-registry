@@ -1,0 +1,384 @@
+"""Tests for AuditExtender: contract compliance, record shape, allow/deny decisions, error handling
+and NdjsonAuditSink; __call__ tests build a HookContext manually, mirroring core's own instrumentation."""
+
+from __future__ import annotations
+
+import json
+import logging
+import pickle  # nosec
+import stat
+from collections.abc import Mapping
+from contextlib import AbstractContextManager
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from mloda.steward import Extender, ExtenderHook, verified_context
+from mloda.user import ParallelizationMode
+
+from mloda.enterprise.extenders.audit import AuditExtender, NdjsonAuditSink
+from mloda.testing.extenders.contract import ExtenderContractTestMixin
+from mloda.testing.extenders.hook_context import make_hook_context
+from mloda.testing.extenders.runners import expected_value_int, run_value_int
+
+_EXPECTED_RECORD_KEYS = {
+    "record_version",
+    "event_time",
+    "run_id",
+    "tenant_id",
+    "project_id",
+    "principal",
+    "decision",
+    "compliant",
+    "deny_reason",
+    "hook",
+    "feature_group_class",
+    "feature_group_version",
+    "plugin_version",
+    "feature_names",
+    "input_features",
+    "compute_framework_name",
+    "rows_out",
+    "duration_seconds",
+    "status",
+    "error_type",
+}
+
+
+class InMemoryAuditSink:
+    """Collects every written record in memory, in call order; module-level so it survives pickling."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    def write(self, record: Mapping[str, Any]) -> None:
+        self.records.append(dict(record))
+
+
+class TestAuditExtenderContract(ExtenderContractTestMixin):
+    """AuditExtender satisfies the shared Extender contract."""
+
+    @classmethod
+    def extender_class(cls) -> type[Extender]:
+        return AuditExtender
+
+    @classmethod
+    def expected_hooks(cls) -> set[ExtenderHook] | None:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    @classmethod
+    def has_backend_sink(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_real_worker_sink(cls) -> bool:
+        return True
+
+    def make_extender(self, *, raise_on_error: bool | None = None) -> AuditExtender:
+        sink = InMemoryAuditSink()
+        if raise_on_error is None:
+            return AuditExtender(sink=sink)
+        return AuditExtender(sink=sink, raise_on_error=raise_on_error)
+
+    def own_failure(self) -> AbstractContextManager[Any]:
+        return patch.object(InMemoryAuditSink, "write", side_effect=RuntimeError("extender boom"))
+
+    def make_real_worker_extender_and_marker(self, tmp_path: Path) -> tuple[Extender, Path]:
+        marker_path = tmp_path / "audit.ndjson"
+        return AuditExtender(sink=NdjsonAuditSink(marker_path)), marker_path
+
+
+class TestAuditExtenderConstruction:
+    """sink and required_identity are validated once, at construction time."""
+
+    @pytest.mark.parametrize("name", ["tenant_id", "project_id", "principal"])
+    def test_known_identity_name_is_accepted(self, name: str) -> None:
+        AuditExtender(sink=InMemoryAuditSink(), required_identity=(name,))
+
+    def test_unknown_identity_name_raises_value_error(self) -> None:
+        with pytest.raises(ValueError):
+            AuditExtender(sink=InMemoryAuditSink(), required_identity=("bogus",))
+
+    def test_duplicate_required_identity_raises_value_error(self) -> None:
+        with pytest.raises(ValueError):
+            AuditExtender(sink=InMemoryAuditSink(), required_identity=("tenant_id", "tenant_id"))
+
+    def test_invalid_sink_raises_value_error(self) -> None:
+        with pytest.raises(ValueError):
+            AuditExtender(sink=object())  # type: ignore[arg-type]
+
+
+class TestAuditExtenderRecord:
+    """The audit record's shape and the allow/deny/error decisions that fill it."""
+
+    def test_call_without_hook_context_writes_nothing(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        assert extender(lambda a, b: a + b, 3, 4) == 7
+        assert sink.records == []
+
+    def test_call_writes_exactly_one_record(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        with make_hook_context(tenant_id="tenant-1").activate():
+            assert extender(lambda a, b: a + b, 3, 4) == 7
+
+        assert len(sink.records) == 1
+
+    def test_record_has_exactly_the_expected_keys(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        with make_hook_context(tenant_id="tenant-1").activate():
+            extender(lambda: None)
+
+        assert set(sink.records[0]) == _EXPECTED_RECORD_KEYS
+
+    def test_event_time_is_rfc3339_utc(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        with make_hook_context(tenant_id="tenant-1").activate():
+            extender(lambda: None)
+
+        event_time = sink.records[0]["event_time"]
+        assert event_time.endswith("Z")
+        datetime.fromisoformat(event_time.removesuffix("Z"))
+
+    def test_identity_and_feature_group_fields_are_copied_from_context(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+        context = make_hook_context(
+            feature_group_class="my.module.MyFeatureGroup",
+            feature_group_version="3",
+            plugin_version="1.2.3",
+            feature_names=("value_int", "value_str"),
+            input_features=frozenset({"b_feature", "a_feature"}),
+            compute_framework_name="PyArrowTable",
+            tenant_id="tenant-1",
+            project_id="project-1",
+            principal="svc-1",
+            run_id="run-123",
+        )
+
+        with context.activate():
+            extender(lambda: None)
+
+        record = sink.records[0]
+        assert record["feature_group_class"] == "my.module.MyFeatureGroup"
+        assert record["feature_group_version"] == "3"
+        assert record["plugin_version"] == "1.2.3"
+        assert record["feature_names"] == ["value_int", "value_str"]
+        assert record["input_features"] == ["a_feature", "b_feature"]
+        assert record["compute_framework_name"] == "PyArrowTable"
+        assert record["tenant_id"] == "tenant-1"
+        assert record["project_id"] == "project-1"
+        assert record["principal"] == "svc-1"
+        assert record["run_id"] == "run-123"
+        assert record["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name
+
+    def test_input_features_none_stays_none(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        with make_hook_context(tenant_id="tenant-1", input_features=None).activate():
+            extender(lambda: None)
+
+        assert sink.records[0]["input_features"] is None
+
+    def test_all_required_identity_present_allows(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, required_identity=("tenant_id", "project_id", "principal"))
+
+        with make_hook_context(tenant_id="t", project_id="p", principal="s").activate():
+            extender(lambda: None)
+
+        record = sink.records[0]
+        assert record["decision"] == "allow"
+        assert record["compliant"] is True
+        assert record["deny_reason"] is None
+
+    @pytest.mark.parametrize(
+        ("tenant_id", "project_id", "principal", "expected_reason"),
+        [
+            (None, "p", "s", "missing_tenant_id"),
+            ("t", "p", None, "missing_principal"),
+            (None, "p", None, "missing_tenant_id_and_principal"),
+            ("", "p", "s", "missing_tenant_id"),
+            ("t", "p", "   ", "missing_principal"),
+        ],
+    )
+    def test_missing_required_identity_denies_but_still_runs(
+        self,
+        tenant_id: str | None,
+        project_id: str | None,
+        principal: str | None,
+        expected_reason: str,
+    ) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, required_identity=("tenant_id", "project_id", "principal"))
+        calls = 0
+
+        def func() -> int:
+            nonlocal calls
+            calls += 1
+            return 42
+
+        with make_hook_context(tenant_id=tenant_id, project_id=project_id, principal=principal).activate():
+            result = extender(func)
+
+        assert result == 42
+        assert calls == 1
+        record = sink.records[0]
+        assert record["decision"] == "deny"
+        assert record["compliant"] is False
+        assert record["deny_reason"] == expected_reason
+
+    def test_wrapped_failure_records_error_status_and_propagates(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+        calls = 0
+        marker = "SENSITIVE_ROW_VALUE_xyz123"
+
+        def func() -> None:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError(f"inner boom: {marker}")
+
+        with make_hook_context(tenant_id="tenant-1").activate():
+            with pytest.raises(RuntimeError, match="inner boom"):
+                extender(func)
+
+        assert calls == 1
+        record = sink.records[0]
+        assert record["status"] == "error"
+        assert record["error_type"] == "builtins.RuntimeError"
+        assert marker not in json.dumps(record)
+
+    def test_successful_call_records_success_and_no_error_type(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        with make_hook_context(tenant_id="tenant-1").activate():
+            extender(lambda: None)
+
+        record = sink.records[0]
+        assert record["status"] == "success"
+        assert record["error_type"] is None
+
+    def test_keyboard_interrupt_records_error_and_propagates(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        def func() -> None:
+            raise KeyboardInterrupt()
+
+        with make_hook_context(tenant_id="tenant-1").activate():
+            with pytest.raises(KeyboardInterrupt):
+                extender(func)
+
+        assert len(sink.records) == 1
+        record = sink.records[0]
+        assert record["status"] == "error"
+        assert record["error_type"] == "builtins.KeyboardInterrupt"
+
+    def test_wrapped_failure_and_sink_failure_propagates_original_and_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class _AlwaysFailingSink:
+            def write(self, record: Mapping[str, Any]) -> None:
+                raise RuntimeError("sink boom")
+
+        extender = AuditExtender(sink=_AlwaysFailingSink())
+
+        def func() -> None:
+            raise RuntimeError("inner boom")
+
+        with make_hook_context(tenant_id="tenant-1").activate():
+            with caplog.at_level(logging.WARNING):
+                with pytest.raises(RuntimeError, match="inner boom"):
+                    extender(func)
+
+        warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("AuditExtender" in message for message in warnings)
+
+
+class TestNdjsonAuditSink:
+    """NdjsonAuditSink appends one JSON line per record, surviving a pickle round trip."""
+
+    def test_appends_one_json_line_per_write(self, tmp_path: Path) -> None:
+        path = tmp_path / "audit.ndjson"
+        sink = NdjsonAuditSink(path)
+
+        sink.write({"a": 1})
+        sink.write({"a": 2})
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert [json.loads(line) for line in lines] == [{"a": 1}, {"a": 2}]
+
+    def test_pickled_copy_appends_to_the_same_file(self, tmp_path: Path) -> None:
+        path = tmp_path / "audit.ndjson"
+        sink = NdjsonAuditSink(path)
+        sink.write({"a": 1})
+
+        copy = pickle.loads(pickle.dumps(sink))  # nosec
+        copy.write({"a": 2})
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert [json.loads(line) for line in lines] == [{"a": 1}, {"a": 2}]
+
+    def test_new_file_has_owner_only_permissions(self, tmp_path: Path) -> None:
+        path = tmp_path / "audit.ndjson"
+        sink = NdjsonAuditSink(path)
+
+        sink.write({"a": 1})
+
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_oversized_record_lands_as_one_exact_line(self, tmp_path: Path) -> None:
+        path = tmp_path / "audit.ndjson"
+        sink = NdjsonAuditSink(path)
+        record = {"feature_names": ["f" * 50] * 500}
+        assert len(json.dumps(record)) > 16 * 1024
+
+        sink.write(record)
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0]) == record
+
+
+class TestAuditExtenderRunAll:
+    """run_all round trips: identity resolved through verified_context, or missing entirely."""
+
+    @pytest.mark.parametrize("mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING])
+    def test_run_all_with_verified_context_allows_and_records(self, mode: ParallelizationMode) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        with verified_context(tenant_id="tenant-42", project_id="project-7", principal="svc"):
+            values = run_value_int(extender, parallelization_modes={mode})
+
+        assert values == expected_value_int()
+        assert sink.records
+        for record in sink.records:
+            assert record["tenant_id"] == "tenant-42"
+            assert record["decision"] == "allow"
+            assert record["status"] == "success"
+            assert record["run_id"] is not None
+
+    def test_run_all_without_verified_context_denies_but_still_runs(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        values = run_value_int(extender)
+
+        assert values == expected_value_int()
+        assert sink.records
+        for record in sink.records:
+            assert record["decision"] == "deny"
+            assert record["deny_reason"] == "missing_tenant_id"
