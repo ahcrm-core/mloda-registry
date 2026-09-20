@@ -22,9 +22,10 @@ _ALLOWED_IDENTITY_NAMES = ("tenant_id", "project_id", "principal")
 
 _open_calculates: OpenInvocationStack[list[tuple[str, str | None]]] = OpenInvocationStack("audit_open_calculates")
 
-_URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.:-]*")
+_URI_SCHEME = re.compile(r"[A-Za-z][\w+.:-]*")
 _QUERY_OR_FRAGMENT = re.compile(r"[?#]")
-_NON_HOST_CHAR = re.compile(r"[^A-Za-z0-9._~%:\[\]-]")
+_PATH_PARAMS = re.compile(r"[;&]")
+_AUTHORITY_LEAK = re.compile(r"[;&=\s]")
 
 
 class AuditSink(Protocol):
@@ -56,15 +57,17 @@ def _error_type(exc: BaseException) -> str:
 
 
 def _sanitize_data_access_identity(identity: str) -> str:
-    # Core's own userinfo strip can leave query text in the authority, so strip again and cut at any odd host char.
+    # Core's own userinfo strip is greedy and can leave query text in the string, so the authority and path
+    # are cut at leak markers too. Userinfo goes first: ; and & are valid inside it.
     scheme, separator, rest = identity.partition("://")
     if not separator or not _URI_SCHEME.fullmatch(scheme):
         return identity
     rest = _QUERY_OR_FRAGMENT.split(rest, maxsplit=1)[0].rpartition("@")[2]
     authority, slash, path = rest.partition("/")
-    host = _NON_HOST_CHAR.split(authority, maxsplit=1)[0]
-    if host != authority:
-        return f"{scheme}://{host}"
+    path = _PATH_PARAMS.split(path, maxsplit=1)[0]
+    cut_authority = _AUTHORITY_LEAK.split(authority, maxsplit=1)[0]
+    if cut_authority != authority:
+        return f"{scheme}://{cut_authority}"
     return f"{scheme}://{authority}{slash}{path}"
 
 
@@ -76,10 +79,11 @@ class AuditExtender(Extender):
     With fail_closed=True (needs raise_on_error=True), a missing identity writes the deny record and
     raises IdentityRequiredError before the wrapped call, also at FEATURE_GROUP_MATCHED, and runs
     outermost (priority 0).
-    Records also list every data load the call attempted, as index-aligned identity and format lists
-    ([] for none). Only URI-shaped identities are stripped (query, fragment, user information); others
-    are recorded as given, so not credential-free, and a sealed log cannot be redacted afterwards.
-    Keys may be added within record_version 1; an absent key means not recorded."""
+    Records also list the distinct data loads the call attempted, as index-aligned identity and format
+    lists ([] for none; a load without an identity is omitted). URI query, fragment, `;` and `&` parameters
+    and user information are stripped, best effort; other identities are recorded as given, so not
+    credential-free, and a sealed log cannot be redacted afterwards. Keys may be added within
+    record_version 1; an absent key means not recorded."""
 
     def __init__(
         self,
@@ -131,7 +135,7 @@ class AuditExtender(Extender):
 
         # A load only runs inside a calculate call that already passed the gate.
         if context.hook is ExtenderHook.INPUT_DATA_LOAD:
-            self._note_load(context)
+            self._note_load(context, args)
             return func(*args, **kwargs)
 
         if self.fail_closed:
@@ -170,14 +174,16 @@ class AuditExtender(Extender):
         self.sink.write(record)
         return result
 
-    def _note_load(self, context: HookContext) -> None:
+    def _note_load(self, context: HookContext, args: tuple[Any, ...]) -> None:
         loads = _open_calculates.find(self)
         if loads is None:
             logger.debug("AuditExtender: INPUT_DATA_LOAD has no enclosing open calculate invocation to attach to")
             return
         if context.data_access_identity is None:
             return
-        entry = (_sanitize_data_access_identity(context.data_access_identity), context.data_access_format)
+        # Core passes the raw data_access first; using it avoids core's lossy greedy strip.
+        raw = args[0] if args and isinstance(args[0], str) else context.data_access_identity
+        entry = (_sanitize_data_access_identity(raw), context.data_access_format)
         if entry not in loads:
             loads.append(entry)
 

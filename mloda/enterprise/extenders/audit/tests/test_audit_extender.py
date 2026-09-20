@@ -100,6 +100,9 @@ class _CountingCall:
 
 _BUCKET_KEY = "s3://bucket/key.parquet"
 
+# Stands in for the FeatureSet core passes after data_access.
+_FEATURES_PLACEHOLDER = object()
+
 _OUTER_CLASS = "my.module.OuterFeatureGroup"
 _INNER_CLASS = "my.module.InnerFeatureGroup"
 
@@ -111,10 +114,12 @@ def _load_context(identity: str | None, data_format: str | None = None) -> HookC
     )
 
 
-def _load(extender: Callable[..., Any], identity: str | None, data_format: str | None = None) -> Any:
-    """Run one wrapped load; call it from inside a calculate call."""
+def _load(
+    extender: Callable[..., Any], identity: str | None, data_format: str | None = None, *, args: tuple[Any, ...] = ()
+) -> Any:
+    """Run one wrapped load, passing args to the wrapped call; call it from inside a calculate call."""
     with _load_context(identity, data_format).activate():
-        return extender(lambda: "loaded")
+        return extender(lambda *_: "loaded", *args)
 
 
 def _calculate(extender: Callable[..., Any], body: Callable[[], Any], feature_group_class: str = _OUTER_CLASS) -> Any:
@@ -123,14 +128,14 @@ def _calculate(extender: Callable[..., Any], body: Callable[[], Any], feature_gr
         return extender(body)
 
 
-def _record_for_loads(loads: list[tuple[str | None, str | None]]) -> dict[str, Any]:
-    """The record of one calculate call that ran the given (identity, format) loads."""
+def _record_for_loads(loads: list[tuple[str | None, str | None]], args: tuple[Any, ...] = ()) -> dict[str, Any]:
+    """The record of one calculate call that ran the given (identity, format) loads, each called with args."""
     sink = InMemoryAuditSink()
     extender = AuditExtender(sink=sink)
 
     def body() -> None:
         for identity, data_format in loads:
-            _load(extender, identity, data_format)
+            _load(extender, identity, data_format, args=args)
 
     _calculate(extender, body)
 
@@ -173,6 +178,74 @@ _URI_SANITIZER_CASES = [
     pytest.param("https://host?x=1", "https://host", ("x=1",), id="query_directly_after_host"),
     pytest.param("https://host/p?", "https://host/p", (), id="empty_query"),
     pytest.param("https://u:p@ss@host/db", "https://host/db", ("p@ss",), id="synthetic_at_sign_inside_userinfo"),
+    pytest.param(
+        "jdbc:hive2://h:10000/default;user=u;password=SECRET",
+        "jdbc:hive2://h:10000/default",
+        ("SECRET",),
+        id="jdbc_semicolon_params_cut_from_path",
+    ),
+    pytest.param(
+        "jdbc:sqlserver://h:1433;password=SECRET",
+        "jdbc:sqlserver://h:1433",
+        ("SECRET",),
+        id="jdbc_semicolon_params_cut_from_authority",
+    ),
+    pytest.param("my_scheme://host?tok=SECRET", "my_scheme://host", ("SECRET",), id="underscore_in_scheme"),
+    pytest.param(
+        "https://b.com/x&sig=SECRET",
+        "https://b.com/x",
+        ("SECRET", "sig"),
+        id="core_greedy_strip_leak_ampersand_tail_in_path",
+    ),
+    pytest.param(
+        "mongodb://h1:27017,h2:27017/db?replicaSet=rs",
+        "mongodb://h1:27017,h2:27017/db",
+        ("replicaSet",),
+        id="multi_host_authority_stays_intact",
+    ),
+    pytest.param("s3://münchen-bucket/key.parquet", "s3://münchen-bucket/key.parquet", (), id="non_ascii_host_kept"),
+    pytest.param(
+        "s3://bucket/t/dt=2026-09-20/part.parquet",
+        "s3://bucket/t/dt=2026-09-20/part.parquet",
+        (),
+        id="hive_style_equals_in_path_kept",
+    ),
+    pytest.param(
+        "postgresql://user:pa/ss@host/db", "postgresql://host/db", ("pa/ss",), id="synthetic_slash_in_password"
+    ),
+    pytest.param("postgresql://u:p&q@host/db", "postgresql://host/db", ("p&q",), id="synthetic_ampersand_in_password"),
+    pytest.param(
+        "https://host=SECRET/p/a", "https://host", ("SECRET",), id="equals_in_authority_cuts_it_and_drops_the_path"
+    ),
+    pytest.param(
+        "https://host SECRET/p/a", "https://host", ("SECRET",), id="whitespace_in_authority_cuts_it_and_drops_the_path"
+    ),
+]
+
+# (raw data_access, identity core put on the load context, sanitized raw, secret markers absent from the record)
+_RAW_FIRST_CASES = [
+    pytest.param(
+        "https://host/p?email=a@b.com/x&sig=SECRET",
+        "https://b.com/x&sig=SECRET",
+        "https://host/p",
+        ("SECRET", "a@b.com", "b.com"),
+        id="at_sign_in_query_value",
+    ),
+    pytest.param(
+        "https://host/dl?url=https://user@o.example/f&token=SECRET",
+        "https://o.example/f&token=SECRET",
+        "https://host/dl",
+        ("SECRET", "o.example"),
+        id="uri_in_query_value",
+    ),
+    pytest.param(
+        "postgresql://host/db?user=u&password=p@ss/word",
+        "postgresql://ss/word",
+        "postgresql://host/db",
+        ("p@ss", "ss/word"),
+        id="password_with_at_sign_and_slash_in_query",
+    ),
+    pytest.param("/data/dir?/file#1.csv", "/data/dir", "/data/dir?/file#1.csv", (), id="non_uri_str_recorded_as_given"),
 ]
 
 _NON_URI_IDENTITIES = [
@@ -814,6 +887,31 @@ class TestAuditExtenderDataAccess:
 
         assert record["data_access_identity"] == [raw]
 
+    @pytest.mark.parametrize(("raw", "context_identity", "expected", "secrets"), _RAW_FIRST_CASES)
+    def test_a_str_first_argument_is_sanitized_instead_of_the_lossy_context_identity(
+        self, raw: str, context_identity: str, expected: str, secrets: tuple[str, ...]
+    ) -> None:
+        record = _record_for_loads([(context_identity, "CsvReader")], args=(raw, _FEATURES_PLACEHOLDER))
+
+        assert record["data_access_identity"] == [expected]
+        assert record["data_access_format"] == ["CsvReader"]
+        for secret in secrets:
+            assert secret not in json.dumps(record)
+
+    def test_a_non_str_first_argument_falls_back_to_the_context_identity(self) -> None:
+        connection_params = {"host": "h", "port": 5432, "api_key": "SECRET"}
+
+        record = _record_for_loads([("{host, port}", None)], args=(connection_params, _FEATURES_PLACEHOLDER))
+
+        assert record["data_access_identity"] == ["{host, port}"]
+        assert "SECRET" not in json.dumps(record)
+
+    def test_a_load_without_a_context_identity_is_skipped_even_with_a_uri_first_argument(self) -> None:
+        record = _record_for_loads([(None, "CsvReader")], args=("https://host/p?sig=SECRET", _FEATURES_PLACEHOLDER))
+
+        assert record["data_access_identity"] == []
+        assert record["data_access_format"] == []
+
 
 class TestNdjsonAuditSink:
     """NdjsonAuditSink appends one JSON line per record, surviving a pickle round trip."""
@@ -922,16 +1020,25 @@ class TestAuditExtenderRunAll:
             assert record["run_id"] is not None
             assert record["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name
 
-    def test_run_all_csv_read_records_the_load_identity_and_format(self, tmp_path: Path) -> None:
-        # SYNC-only: run_csv_feature takes no parallelization modes.
-        sink = InMemoryAuditSink()
-        extender = AuditExtender(sink=sink)
+    @pytest.mark.parametrize(
+        "mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING, ParallelizationMode.MULTIPROCESSING]
+    )
+    def test_run_all_csv_read_records_the_load_identity_and_format(
+        self, mode: ParallelizationMode, tmp_path: Path, request: pytest.FixtureRequest
+    ) -> None:
+        audit_path = tmp_path / "audit.ndjson"
+        extender = AuditExtender(sink=NdjsonAuditSink(audit_path))
+        # Only MULTIPROCESSING needs the flight_server fixture.
+        flight_server = (
+            request.getfixturevalue("flight_server") if mode == ParallelizationMode.MULTIPROCESSING else None
+        )
 
         with verified_context(tenant_id="tenant-42"):
-            run_csv_feature(tmp_path, extender)
+            run_csv_feature(tmp_path, extender, parallelization_modes={mode}, flight_server=flight_server)
 
         read_class = f"{ReadFileFeature.__module__}.{ReadFileFeature.__qualname__}"
-        records = [record for record in sink.records if record["feature_group_class"] == read_class]
+        sink_records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+        records = [record for record in sink_records if record["feature_group_class"] == read_class]
         assert len(records) == 1
         assert records[0]["data_access_identity"] == [str(tmp_path / "data.csv")]
         assert records[0]["data_access_format"] == ["CsvReader"]
