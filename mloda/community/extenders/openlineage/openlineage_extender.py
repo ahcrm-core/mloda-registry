@@ -69,12 +69,12 @@ def _get_or_create_close_state(client: OpenLineageClient) -> _CloseState:
 
 class OpenLineageExtender(Extender):
     """Emits one OpenLineage START/COMPLETE|FAIL|ABORT RunEvent per calculate invocation, correlating nested
-    INPUT_DATA_LOAD calls and the calculate context's input features as inputs. Sink resolution: injected client
-    wins, else use_sdk_defaults, else inert. Emits happen synchronously on the calculation thread, so a blocking
-    transport delays every wrapped calculation. close() flushes the client and is terminal. A self-built client is
-    rebuilt per worker; an injected client that can't survive pickling is dropped by a trial-pickle probe and falls
-    back to the resolution rule above, while a picklable injected client is pickled as-is. Workers are terminated
-    without a flush, so a synchronous transport is needed there."""
+    INPUT_DATA_LOAD calls and the calculate context's input features as inputs. Sink resolution: injected client wins,
+    else use_sdk_defaults, else inert. Emits happen synchronously on the calculation thread, so a blocking transport
+    delays every wrapped calculation. close() flushes the client and is terminal. A self-built client is rebuilt per
+    worker; an injected client that can't survive pickling is dropped by a trial-pickle probe and falls back to the
+    resolution rule above, while a picklable injected client is pickled as-is. Workers are
+    terminated without a flush, so a synchronous transport is needed there."""
 
     _ATEXIT_CLOSE_TIMEOUT = 10.0
 
