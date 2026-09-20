@@ -205,9 +205,9 @@ Conventions:
 
 The generator adds `mloda-testing = { workspace = true }` only for top-level packages
 (depth <= 2) that receive default dev deps, plus one such entry for each sibling in a
-top-level package's runtime `dependencies` (uv will not lock without it). Nested packages cannot use workspace
-sources due to uv resolution limits; they get dev deps but rely on root workspace
-resolution.
+top-level package's runtime `dependencies` (uv will not lock without it). Nested
+packages cannot use workspace sources due to uv resolution limits; they get dev deps
+but rely on root workspace resolution.
 
 ## Common workflows
 

@@ -76,10 +76,10 @@ class AuditExtender(Extender):
     With fail_closed=True (needs raise_on_error=True), a missing identity writes the deny record and
     raises IdentityRequiredError before the wrapped call, also at FEATURE_GROUP_MATCHED, and runs
     outermost (priority 0).
-    Records also list every data load the call attempted (sanitized identity and format, index-aligned
-    lists). The query string, fragment and URI user information are stripped; other identities are
-    recorded as given, so they are not credential-free. Keys may be added within record_version 1;
-    an absent key means not recorded."""
+    Records also list every data load the call attempted, as index-aligned identity and format lists
+    ([] for none). Only URI-shaped identities are stripped (query, fragment, user information); others
+    are recorded as given, so not credential-free, and a sealed log cannot be redacted afterwards.
+    Keys may be added within record_version 1; an absent key means not recorded."""
 
     def __init__(
         self,

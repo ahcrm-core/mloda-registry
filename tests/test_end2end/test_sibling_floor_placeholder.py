@@ -86,8 +86,7 @@ def _generated_optional_dependencies(
 
 
 def _generated_uv_sources(pkg_name: str, packages: dict[str, dict[str, Any]], shared: dict[str, Any]) -> dict[str, Any]:
-    """Parsed ``[tool.uv.sources]`` of the generated pyproject for ``pkg_name`` ({} when absent). A second
-    ``[tool.uv.sources]`` header is invalid TOML, so parsing also pins that the table is emitted once."""
+    """Parsed ``[tool.uv.sources]`` of the generated pyproject ({} when absent); a duplicate header is invalid TOML."""
     content = gen.generate_pyproject(pkg_name, packages[pkg_name], shared, packages)
     sources: dict[str, Any] = tomllib.loads(content).get("tool", {}).get("uv", {}).get("sources", {})
     return sources
@@ -421,8 +420,7 @@ def test_generate_raises_when_version_missing_for_placeholder_dependency() -> No
 def test_top_level_package_gets_a_workspace_source_for_a_sibling_dependency(
     dependency: str, entry_point_bundle: bool
 ) -> None:
-    """uv only resolves a workspace dependency of a top-level member (path depth <= 2) through a
-    ``{ workspace = true }`` source, so a sibling in its runtime dependencies must get one."""
+    """A sibling in a top-level package's runtime dependencies gets a ``{ workspace = true }`` source (uv needs it)."""
     shared, _packages_config = gen.load_configs()
     packages = _synthetic_packages_with_dependent(
         _TOP_LEVEL_PATH, ["{core_dependency}", dependency], entry_point_bundle=entry_point_bundle
@@ -449,8 +447,7 @@ def test_nested_package_gets_no_workspace_source_for_a_sibling_dependency(path: 
 
 
 def test_top_level_package_with_default_dev_deps_lists_mloda_testing_and_its_sibling_in_one_table() -> None:
-    """A top-level package with the default dev deps keeps its ``mloda-testing`` source and adds the
-    sibling; the siblings stay in sorted order however the dependencies are listed."""
+    """Default dev deps keep the ``mloda-testing`` source beside the sibling sources, which stay sorted."""
     shared, _packages_config = gen.load_configs()
     packages = _synthetic_packages_with_dependent(
         _TOP_LEVEL_PATH, ["{core_dependency}", f"{_DEP}>={{version}}", f"{_LEAF}>={{version}}"]
@@ -465,7 +462,7 @@ def test_top_level_package_with_default_dev_deps_lists_mloda_testing_and_its_sib
 
 
 def test_top_level_package_with_default_dev_deps_and_no_sibling_keeps_only_mloda_testing() -> None:
-    """Regression pin: external and core dependencies get no source, so today's ``mloda-testing``-only table stays."""
+    """External and core dependencies get no source, so only ``mloda-testing`` is listed."""
     shared, _packages_config = gen.load_configs()
     packages = _synthetic_packages_with_dependent(_TOP_LEVEL_PATH, ["{core_dependency}", "pytest>=9.0.3"])
 
@@ -475,8 +472,7 @@ def test_top_level_package_with_default_dev_deps_and_no_sibling_keeps_only_mloda
 
 
 def test_real_bundles_workspace_sources_follow_their_sibling_dependencies() -> None:
-    """mloda-enterprise (top-level, depends on the shared extenders package) needs a source for it, or
-    uv lock fails; mloda-community (top-level bundle, no sibling dependency) has no sources table."""
+    """mloda-enterprise needs a source for the shared extenders package or uv lock fails; mloda-community has none."""
     shared, packages_config = gen.load_configs()
     packages: dict[str, dict[str, Any]] = packages_config["packages"]
     sibling = "mloda-community-extenders-shared"

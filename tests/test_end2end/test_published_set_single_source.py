@@ -821,8 +821,7 @@ def test_bundle_declares_every_nested_leaf_external_runtime_dependency() -> None
     import cleanly without the dependency; see mloda-community-openlineage). This guards the invariant
     for the FUTURE: nothing else stops a new bundled leaf with an external runtime dependency from
     being added without covering it in the bundle again (as mloda-community-otel's opentelemetry-api
-    once was). The same holds for a sibling dependency that is neither the bundle nor nested under it:
-    the bundle's own ``dependencies`` or non-dev extras must list that sibling too."""
+    once was). Likewise for a sibling outside the bundle: the bundle must list it too."""
     packages = _packages()
     core_placeholder = "{core_dependency}"
 
@@ -866,10 +865,10 @@ def test_bundle_declares_every_nested_leaf_external_runtime_dependency() -> None
                 if name in packages and name != bundle_name and name not in nested_names:
                     # A sibling outside the bundle: the "{version}" floor reads the same on both sides.
                     assert name in bundle_siblings, (
-                        f"{nested_name} declares sibling dependency {dep!r} on {name!r}, which is neither "
-                        f"{bundle_name} nor nested under it, but {bundle_name} does not list {name!r} in its own "
-                        f"'dependencies' or in one of its extras; {bundle_name} ships {nested_name}'s code "
-                        f"without inheriting its pyproject.toml, so nothing else installs {name!r} for it."
+                        f"{nested_name} declares sibling dependency {dep!r}, outside {bundle_name}, but "
+                        f"{bundle_name} does not list {name!r} in its own 'dependencies' or in one of its extras; "
+                        f"{bundle_name} ships {nested_name}'s code without its pyproject.toml, so nothing else "
+                        f"installs {name!r} for it."
                     )
                 if name in packages or name == "mloda":
                     continue  # internal-registry dependency, or the core dependency's own expansion

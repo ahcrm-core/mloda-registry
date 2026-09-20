@@ -262,7 +262,7 @@ def verify_dependency_relationships(wheels: dict[str, Path]) -> list[str]:
 
     Note: mloda-community and mloda-enterprise are bundled packages that include
     all sub-package code directly, so they don't have dependencies on sub-packages
-    (a sibling outside the bundle's path, such as mloda-community-extenders-shared, is still declared).
+    (except on a sibling outside their path).
     """
     errors = []
 

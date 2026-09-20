@@ -105,7 +105,7 @@ _INNER_CLASS = "my.module.InnerFeatureGroup"
 
 
 def _load_context(identity: str | None, data_format: str | None = None) -> HookContext:
-    """An INPUT_DATA_LOAD context; it carries no tenant_id, so a load that got gated would be refused."""
+    """An INPUT_DATA_LOAD context without a tenant_id, so a load that got gated would be refused."""
     return make_hook_context(
         hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity=identity, data_access_format=data_format
     )
@@ -124,7 +124,7 @@ def _calculate(extender: Callable[..., Any], body: Callable[[], Any], feature_gr
 
 
 def _record_for_loads(loads: list[tuple[str | None, str | None]]) -> dict[str, Any]:
-    """The single record of one calculate call that ran the given (identity, format) loads."""
+    """The record of one calculate call that ran the given (identity, format) loads."""
     sink = InMemoryAuditSink()
     extender = AuditExtender(sink=sink)
 
@@ -139,7 +139,7 @@ def _record_for_loads(loads: list[tuple[str | None, str | None]]) -> dict[str, A
 
 
 def _assert_logged_no_enclosing_calculate(caplog: pytest.LogCaptureFixture) -> None:
-    """Exactly one DEBUG message from the audit extender's own logger says the load had no open calculate."""
+    """Exactly one DEBUG message from the audit extender's logger says the load had no open calculate."""
     matching = [
         r
         for r in caplog.records
