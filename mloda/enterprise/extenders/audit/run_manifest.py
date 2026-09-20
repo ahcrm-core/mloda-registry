@@ -5,7 +5,12 @@ later fail verification by design. verify_ndjson_log returns the head: anchor it
 as expected_head, because removing the newest manifests or the whole log is otherwise undetectable.
 
 Limits:
-- HMAC is symmetric: integrity, not non-repudiation.
+- HMAC is symmetric: integrity only. Ed25519Signer adds non-repudiation: only the private key holder can seal. A
+  public-key signer (`Ed25519Signer.from_public_key`) verifies but cannot seal, rotate or repair
+  (`quarantine_damaged_lines(dry_run=True)` works). HMAC-era seals stay repudiable, and moving a log from HMAC to
+  Ed25519 needs a new key_id. A log that began under an HMAC key still needs that retired key in `previous_signers` on
+  every verifying host, so its verifier holds an HMAC secret. Distributing the public key is out of scope. A
+  KMS-backed signer plugs in through the unchanged `ManifestSigner` protocol.
 - Records without a usable run_id and unsealed runs sit outside every seal (verify_ndjson_log_coverage counts them).
 - One manifest log per audit file; sealers serialise on flock (POSIX), but not at all where fcntl is missing, so
   concurrent sealers, rotations and recoveries then race. `previous_signers` verifies manifests a retired key sealed
@@ -30,6 +35,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
 import tempfile
 from collections import Counter
@@ -37,14 +43,20 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Protocol
 
 from mloda.enterprise.extenders.audit._records import _append_records, _canonical_json, _is_blank, _utc_now
+
+if TYPE_CHECKING:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 _MANIFEST_VERSION = 1
 _QUARANTINE_VERSION = 1
 _HASH_ALGORITHM = "sha256"
 _MIN_KEY_BYTES = 32
+_ED25519_KEY_BYTES = 32
+_ED25519_SIGNATURE = re.compile(r"[0-9a-f]{128}")
 _SIGNATURE_KEYS = {"algorithm", "key_id", "value"}
 _ROTATION_KIND = "key_rotation"
 _ROTATION_KEYS = {"manifest_version", "kind", "rotated_at", "previous_manifest_hash", "signature"}
@@ -62,6 +74,11 @@ class ManifestSigner(Protocol):
     def verify(self, payload: bytes, signature: str) -> bool: ...
 
 
+def _check_key_id(owner: str, key_id: object) -> None:
+    if not isinstance(key_id, str) or not key_id.strip():
+        raise ValueError(f"{owner} key_id must be a non-blank string")
+
+
 class HmacSha256Signer:
     """HMAC-SHA256 over a shared key of at least 32 bytes."""
 
@@ -70,8 +87,7 @@ class HmacSha256Signer:
     def __init__(self, key: bytes, key_id: str) -> None:
         if not isinstance(key, bytes) or len(key) < _MIN_KEY_BYTES:
             raise ValueError(f"HmacSha256Signer key must be bytes of at least {_MIN_KEY_BYTES} bytes")
-        if not isinstance(key_id, str) or not key_id.strip():
-            raise ValueError("HmacSha256Signer key_id must be a non-blank string")
+        _check_key_id("HmacSha256Signer", key_id)
         self._key = key
         self.key_id = key_id
 
@@ -84,6 +100,66 @@ class HmacSha256Signer:
     def verify(self, payload: bytes, signature: str) -> bool:
         # compare_digest raises TypeError on a non-ASCII str.
         return signature.isascii() and hmac.compare_digest(self.sign(payload), signature)
+
+
+def _ed25519() -> ModuleType:
+    """The cryptography ed25519 module, imported per call because the extra is optional."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+    except ImportError as exc:
+        raise ImportError(
+            "Ed25519Signer needs the 'cryptography' package: pip install mloda-enterprise[ed25519]"
+        ) from exc
+    return ed25519
+
+
+def _check_ed25519_key(name: str, key: object) -> None:
+    if not isinstance(key, bytes) or len(key) != _ED25519_KEY_BYTES:
+        raise ValueError(f"Ed25519Signer {name} must be bytes of exactly {_ED25519_KEY_BYTES} bytes")
+
+
+class Ed25519Signer:
+    """Ed25519 over raw 32-byte keys (`private_bytes_raw()`, `public_bytes_raw()`); needs the `ed25519` extra."""
+
+    algorithm = "Ed25519"
+
+    def __init__(self, private_key: bytes, key_id: str) -> None:
+        _check_ed25519_key("private_key", private_key)
+        _check_key_id("Ed25519Signer", key_id)
+        private: Ed25519PrivateKey = _ed25519().Ed25519PrivateKey.from_private_bytes(private_key)
+        self._private: Ed25519PrivateKey | None = private
+        self._public: Ed25519PublicKey = private.public_key()
+        self.key_id = key_id
+
+    @classmethod
+    def from_public_key(cls, public_key: bytes, key_id: str) -> Ed25519Signer:
+        """A verify-only signer: `sign` raises ValueError."""
+        _check_ed25519_key("public_key", public_key)
+        _check_key_id("Ed25519Signer", key_id)
+        signer = cls.__new__(cls)
+        signer._private = None
+        signer._public = _ed25519().Ed25519PublicKey.from_public_bytes(public_key)
+        signer.key_id = key_id
+        return signer
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(key_id={self.key_id!r})"
+
+    def sign(self, payload: bytes) -> str:
+        if self._private is None:
+            raise ValueError(f"{type(self).__name__} {self.key_id!r} holds only a public key and cannot sign")
+        return self._private.sign(payload).hex()
+
+    def verify(self, payload: bytes, signature: str) -> bool:
+        if not isinstance(signature, str) or not _ED25519_SIGNATURE.fullmatch(signature):
+            return False
+        from cryptography.exceptions import InvalidSignature
+
+        try:
+            self._public.verify(bytes.fromhex(signature), payload)
+        except InvalidSignature:
+            return False
+        return True
 
 
 class ManifestVerificationError(ValueError):
@@ -803,14 +879,12 @@ def quarantine_damaged_lines(
             return []
         # Captured before the lock: an exclusive _flock opens O_CREAT, so afterwards the file always exists.
         existed = os.path.exists(quarantine_path)
+        # Signed before the quarantine lock: a signing failure must not leave the file it creates; a dry run never signs.
+        entries = [] if dry_run else [_trace_entry(item, raw, path, signer) for item, raw, path in damage]
         with _flock(quarantine_path, exclusive=not dry_run):
             _require_terminated(quarantine_path)
             if not dry_run:
-                _append_with_rollback(
-                    quarantine_path,
-                    [_trace_entry(item, raw, path, signer) for item, raw, path in damage],
-                    existed=existed,
-                )
+                _append_with_rollback(quarantine_path, entries, existed=existed)
         if not dry_run:
             if audit_damage:
                 _rewrite_without(audit_path, {item.line for item, _, _ in audit_damage})
