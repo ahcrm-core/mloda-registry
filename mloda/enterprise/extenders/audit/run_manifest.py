@@ -8,11 +8,17 @@ Limits:
 - HMAC is symmetric: integrity, not non-repudiation.
 - Records without a usable run_id and unsealed runs sit outside every seal (verify_ndjson_log_coverage counts them).
 - One manifest log per audit file; sealers serialise on flock (POSIX), but not at all where fcntl is missing, so
-  concurrent sealers and recoveries then race. `previous_signers` is a migration window for verifying manifests
-  signed by a retired key, not a permanent trust set.
-- A key rotation protects a log only from its own first seal under the new key onward: until then, a holder of a
-  retired key in `previous_signers` can still write seals on it that verify. Seal every active log with the new
-  key promptly after rotating.
+  concurrent sealers, rotations and recoveries then race. `previous_signers` verifies manifests a retired key sealed
+  before its rotation entry (it cannot seal after it).
+- Key rotation is an entry in the log (rotate_manifest_key): key order comes from the entries, not `previous_signers`.
+  Rotate every log when changing keys; seals under the retired key before its entry stay valid. Anchor
+  `expected_head` on every rotation. Keep retired keys while their seals must verify (rotating verifies the log with
+  them too). Any keyring key can append a complete rotation entry, which wedges the log for the real current key
+  (availability only, not integrity). Quarantine repairs only a torn tail, so recovery is truncating the log back to
+  an anchored head.
+- Sealing and verifying need the log's current key to be `signer` (an archived log verifies with its current key).
+  The check is load-bearing: it stops an unused keyring key from taking the log over.
+- verify_manifest on a single manifest cannot order keys.
 - A torn or undecodable line fails sealing and verification until quarantine_damaged_lines repairs it. It repairs
   only a torn manifest tail and the audit lines the readers reject; anything else stays a hard failure.
 """
@@ -40,6 +46,8 @@ _QUARANTINE_VERSION = 1
 _HASH_ALGORITHM = "sha256"
 _MIN_KEY_BYTES = 32
 _SIGNATURE_KEYS = {"algorithm", "key_id", "value"}
+_ROTATION_KIND = "key_rotation"
+_ROTATION_KEYS = {"manifest_version", "kind", "rotated_at", "previous_manifest_hash", "signature"}
 _MAX_PROBLEMS = 20
 
 
@@ -88,6 +96,10 @@ class RunNotPendingError(ValueError):
 
 class RunAlreadySealedError(RunNotPendingError):
     """The run_id is already sealed."""
+
+
+class KeyAlreadyCurrentError(ValueError):
+    """The manifest log is already under the signer's key."""
 
 
 def _sha256(payload: bytes) -> str:
@@ -175,9 +187,8 @@ def _signer_map(signer: ManifestSigner, previous_signers: Iterable[ManifestSigne
     return signers
 
 
-def _verify_manifest_fields(
-    manifest: Mapping[str, Any], signer: ManifestSigner, signers: Mapping[str, ManifestSigner]
-) -> None:
+def _verify_signed(manifest: Mapping[str, Any], signer: ManifestSigner, signers: Mapping[str, ManifestSigner]) -> None:
+    """The signature and manifest_version checks shared by manifests and rotation entries."""
     signature = manifest.get("signature")
     # The block is unsigned, so an unknown member could carry anything.
     if not isinstance(signature, Mapping) or set(signature) != _SIGNATURE_KEYS:
@@ -203,6 +214,12 @@ def _verify_manifest_fields(
     version = manifest.get("manifest_version")
     if type(version) is not int or version != _MANIFEST_VERSION:
         raise ManifestVerificationError(f"unsupported manifest_version {version!r}")
+
+
+def _verify_manifest_fields(
+    manifest: Mapping[str, Any], signer: ManifestSigner, signers: Mapping[str, ManifestSigner]
+) -> None:
+    _verify_signed(manifest, signer, signers)
     if manifest.get("hash_algorithm") != _HASH_ALGORITHM:
         raise ManifestVerificationError(f"unsupported hash_algorithm {manifest.get('hash_algorithm')!r}")
     hashes = manifest.get("record_hashes")
@@ -211,6 +228,25 @@ def _verify_manifest_fields(
         raise ManifestVerificationError(f"record_count {count!r} is not the number of hashes")
     if not isinstance(manifest.get("run_id"), str):
         raise ManifestVerificationError(f"run_id {manifest.get('run_id')!r} is not a string")
+
+
+def _verify_rotation_fields(
+    entry: Mapping[str, Any], signer: ManifestSigner, signers: Mapping[str, ManifestSigner]
+) -> None:
+    if entry.get("kind") != _ROTATION_KIND or set(entry) != _ROTATION_KEYS:
+        raise ManifestVerificationError(
+            f"a manifest log line with a kind must be a {_ROTATION_KIND!r} entry with exactly {sorted(_ROTATION_KEYS)}"
+        )
+    _verify_signed(entry, signer, signers)
+
+
+def _rotation_transition(key_id: str, active: str | None, retired: frozenset[str]) -> tuple[str, frozenset[str]]:
+    """The (active, retired) keys after a rotation to `key_id`; raises if the log may not rotate to it."""
+    if active is None:
+        raise ManifestVerificationError("a key rotation entry has no earlier manifest to rotate from")
+    if key_id == active or key_id in retired:
+        raise ManifestVerificationError(f"a key rotation entry is signed by key {key_id!r}, which the log already used")
+    return key_id, retired | {active}
 
 
 def _record_mismatch(manifest: Mapping[str, Any], digest: _RunDigest) -> str:
@@ -355,6 +391,14 @@ def _flock(path: str | Path, *, exclusive: bool) -> Iterator[None]:
             os.close(fd)
 
 
+@dataclass
+class _LogState:
+    sealed: set[str]
+    head: str | None
+    active: str | None
+    retired: frozenset[str]
+
+
 def _verify_log(
     log: Iterable[Mapping[str, Any]],
     *,
@@ -362,31 +406,46 @@ def _verify_log(
     signers: Mapping[str, ManifestSigner],
     expected_head: str | None,
     digests: Mapping[str, _RunDigest] | None = None,
-) -> tuple[set[str], str | None]:
-    """Record and head mismatches are collected into one error (head first); a structural failure raises at once."""
+    require_current: bool = False,
+) -> _LogState:
+    """Record and head mismatches are collected into one error (head first); a structural failure raises at once.
+    The first line's key is current until a rotation entry replaces it."""
     sealed: set[str] = set()
     head: str | None = None
     problems: list[str] = []
-    current_key_seen = False
+    active: str | None = None
+    retired: frozenset[str] = frozenset()
     for manifest in log:
-        _verify_manifest_fields(manifest, signer, signers)
-        run_id: str = manifest["run_id"]
-        # A retired key must not sign at the head once the current key has sealed here.
-        if manifest["signature"]["key_id"] == signer.key_id:
-            current_key_seen = True
-        elif current_key_seen:
-            raise ManifestVerificationError(f"run_id {run_id!r} is signed by a retired key after the current key")
+        is_rotation = "kind" in manifest
+        if is_rotation:
+            _verify_rotation_fields(manifest, signer, signers)
+            active, retired = _rotation_transition(manifest["signature"]["key_id"], active, retired)
+            where = "a key rotation entry"
+        else:
+            _verify_manifest_fields(manifest, signer, signers)
+            run_id: str = manifest["run_id"]
+            key_id = manifest["signature"]["key_id"]
+            if active is None:
+                active = key_id
+            elif key_id != active:
+                raise ManifestVerificationError(
+                    f"run_id {run_id!r} is signed by key {key_id!r}, not the log's current key {active!r}"
+                )
+            where = f"run_id {run_id!r}"
         if manifest.get("previous_manifest_hash") != head:
-            raise ManifestVerificationError(f"manifest chain is broken at run_id {run_id!r}")
-        if run_id in sealed:
-            raise ManifestVerificationError(f"run_id {run_id!r} is sealed by more than one manifest")
-        if digests is not None:
-            try:
-                _verify_digest(manifest, digests.get(run_id, _RunDigest()))
-            except ManifestVerificationError as exc:
-                problems.append(str(exc))
-        sealed.add(run_id)
+            raise ManifestVerificationError(f"manifest chain is broken at {where}")
+        if not is_rotation:
+            if run_id in sealed:
+                raise ManifestVerificationError(f"run_id {run_id!r} is sealed by more than one manifest")
+            if digests is not None:
+                try:
+                    _verify_digest(manifest, digests.get(run_id, _RunDigest()))
+                except ManifestVerificationError as exc:
+                    problems.append(str(exc))
+            sealed.add(run_id)
         head = manifest_hash(manifest)
+    if require_current and active is not None and active != signer.key_id:
+        raise ManifestVerificationError(f"manifest log is under key {active!r}, not the signer's {signer.key_id!r}")
     if expected_head is not None and head != expected_head:
         problems.insert(0, f"manifest log head {head!r} is not the expected head {expected_head!r}")
     if problems:
@@ -394,7 +453,7 @@ def _verify_log(
         if len(problems) > _MAX_PROBLEMS:
             message += f"; and {len(problems) - _MAX_PROBLEMS} more"
         raise ManifestVerificationError(message)
-    return sealed, head
+    return _LogState(sealed, head, active, retired)
 
 
 def _append_and_fsync(path: str | Path, records: Sequence[Mapping[str, Any]]) -> None:
@@ -402,6 +461,47 @@ def _append_and_fsync(path: str | Path, records: Sequence[Mapping[str, Any]]) ->
     _append_records(path, records)
     _fsync(path)
     _fsync(Path(path).parent)
+
+
+def _rotation_entry(signer: ManifestSigner, previous_manifest_hash: str | None) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "manifest_version": _MANIFEST_VERSION,
+        "kind": _ROTATION_KIND,
+        "rotated_at": _utc_now(),
+        "previous_manifest_hash": previous_manifest_hash,
+    }
+    entry["signature"] = _signature_block(entry, signer)
+    return entry
+
+
+def rotate_manifest_key(
+    manifest_path: str | Path,
+    *,
+    signer: ManifestSigner,
+    expected_head: str | None,
+    previous_signers: Iterable[ManifestSigner] = (),
+) -> dict[str, Any]:
+    """Append a signed rotation entry making `signer` the log's current key; return it. Verifies the log first
+    (`previous_signers` must hold its retired keys) and writes nothing on failure. Raises ValueError for a log with no
+    manifests, KeyAlreadyCurrentError when `signer` is already current (a retry needs `expected_head=None` or the
+    post-rotation head) and ManifestVerificationError when `signer` is retired. Pass the anchored head as
+    `expected_head`: the entry chains onto it, so it commits to every earlier line."""
+    signers = _signer_map(signer, previous_signers)
+    nothing_to_rotate = f"{manifest_path} has no manifests to rotate; the first seal defines the key"
+    # Checked before the lock: an exclusive _flock would create the file.
+    if not os.path.exists(manifest_path):
+        raise ValueError(nothing_to_rotate)
+    with _flock(manifest_path, exclusive=True):
+        state = _verify_log(_iter_manifests(manifest_path), signer=signer, signers=signers, expected_head=expected_head)
+        if state.active is None:
+            raise ValueError(nothing_to_rotate)
+        if state.active == signer.key_id:
+            raise KeyAlreadyCurrentError(f"manifest log is already under key {signer.key_id!r}")
+        # Called for its raise only: it raises when `signer` is a retired key.
+        _rotation_transition(signer.key_id, state.active, state.retired)
+        entry = _rotation_entry(signer, state.head)
+        _append_with_rollback(manifest_path, [entry], existed=True)
+        return entry
 
 
 def seal_ndjson_runs(
@@ -417,15 +517,21 @@ def seal_ndjson_runs(
     so sealing a still-live run fails its verification for good. Pass `run_id` when other runs may still be live;
     omit it to sweep an audit file no writer is appending to. Raises RunAlreadySealedError for an already-sealed
     `run_id` (catch that, not ValueError, for an idempotent retry) and RunNotPendingError when it has no records.
+    `signer` must be the log's current key: call rotate_manifest_key after a key change.
     `previous_signers` covers a retired signing key during rotation (see module docstring)."""
     signers = _signer_map(signer, previous_signers)
     _reject_aliased_paths(audit_path=audit_path, manifest_path=manifest_path)
     if run_id is not None and (not isinstance(run_id, str) or _is_blank(run_id)):
         raise ValueError("seal_ndjson_runs run_id must be a non-blank string")
     with _flock(manifest_path, exclusive=True):
-        sealed, head = _verify_log(
-            _iter_manifests(manifest_path), signer=signer, signers=signers, expected_head=expected_head
+        state = _verify_log(
+            _iter_manifests(manifest_path),
+            signer=signer,
+            signers=signers,
+            expected_head=expected_head,
+            require_current=True,
         )
+        sealed, head = state.sealed, state.head
         if run_id is not None and run_id in sealed:
             raise RunAlreadySealedError(f"run_id {run_id!r} is already sealed in {manifest_path}")
         # A manifest must not name records that never reached disk; a missing file is left for _digest_runs
@@ -443,16 +549,7 @@ def seal_ndjson_runs(
             manifest = _seal(pending_run_id, digest, signer=signer, previous_manifest_hash=head)
             manifests.append(manifest)
             head = manifest_hash(manifest)
-        size = os.path.getsize(manifest_path) if os.path.exists(manifest_path) else 0
-        try:
-            _append_and_fsync(manifest_path, manifests)
-        except BaseException:
-            # Under the lock, so only this sealer's partial bytes go.
-            with suppress(OSError):
-                os.truncate(manifest_path, size)
-                _fsync(manifest_path)
-                _fsync(Path(manifest_path).parent)
-            raise
+        _append_with_rollback(manifest_path, manifests, existed=True)
         return manifests
 
 
@@ -488,7 +585,8 @@ def verify_ndjson_log_coverage(
     expected_head: str | None = None,
 ) -> LogCoverage:
     """Verify like verify_ndjson_log; return a LogCoverage (head, sealed_runs, sealed_lines, unattributed_lines,
-    unsealed_lines). `previous_signers` covers a retired signing key during rotation (see module docstring)."""
+    unsealed_lines). `signer` must be the log's current key: call rotate_manifest_key after a key change.
+    `previous_signers` covers a retired signing key during rotation (see module docstring)."""
     signers = _signer_map(signer, previous_signers)
     _reject_aliased_paths(audit_path=audit_path, manifest_path=manifest_path)
     # Log first: a run sealed after this read looks unsealed, not tampered.
@@ -500,9 +598,11 @@ def verify_ndjson_log_coverage(
         digests = _digest_runs(audit_path, sealed.__contains__, uncovered)
     except FileNotFoundError:
         digests = {}
-    _, head = _verify_log(manifests, signer=signer, signers=signers, expected_head=expected_head, digests=digests)
+    state = _verify_log(
+        manifests, signer=signer, signers=signers, expected_head=expected_head, digests=digests, require_current=True
+    )
     return LogCoverage(
-        head=head,
+        head=state.head,
         sealed_runs=len(sealed),
         sealed_lines=sum(len(digest.hashes) for digest in digests.values()),
         unattributed_lines=uncovered.unattributed,
@@ -520,6 +620,7 @@ def verify_ndjson_log(
 ) -> str | None:
     """Raise ManifestVerificationError unless every manifest matches the audit bytes of its run. Returns the head:
     anchor it outside the log and pass it back as `expected_head`, or a truncated log goes undetected.
+    `signer` must be the log's current key: call rotate_manifest_key after a key change.
     `previous_signers` covers a retired signing key during rotation (see module docstring)."""
     return verify_ndjson_log_coverage(
         audit_path, manifest_path, signer=signer, previous_signers=previous_signers, expected_head=expected_head
@@ -583,7 +684,7 @@ def _damaged_manifest_tail(
         lines = []
     tail = lines.pop() if lines and not lines[-1].endswith(b"\n") else b""
     manifests = [_parse_ndjson_line(path, number, raw)[1] for number, raw in enumerate(lines, start=1)]
-    _, head = _verify_log(manifests, signer=signer, signers=signers, expected_head=None)
+    head = _verify_log(manifests, signer=signer, signers=signers, expected_head=None).head
     if expected_head is not None and expected_head not in {manifest_hash(manifest) for manifest in manifests}:
         raise ManifestVerificationError(
             f"manifest log head {head!r} is not the expected head {expected_head!r}, and no earlier manifest has it"
@@ -624,10 +725,11 @@ def _require_terminated(path: str | Path) -> None:
         return
 
 
-def _append_trace(path: str | Path, entries: list[dict[str, Any]], *, existed: bool) -> None:
+def _append_with_rollback(path: str | Path, entries: Sequence[Mapping[str, Any]], *, existed: bool) -> None:
     """Append and fsync under the caller's lock on `path`; a failure restores the file, or removes it if the lock
     created it. Capture `existed` before acquiring the lock: its open(O_CREAT) would otherwise always find the
-    file already there."""
+    file already there. Sealing and rotation pass `existed=True`, so a failed append leaves the log file (truncated)
+    instead of removing it."""
     size = os.path.getsize(path) if os.path.exists(path) else 0
     try:
         _append_and_fsync(path, entries)
@@ -683,6 +785,7 @@ def quarantine_damaged_lines(
     - A valid-JSON unterminated last line is refused in both files (it may be a real seal or record).
     - An anchored `expected_head` must match one of the complete manifests, which bounds how far back the log can
       have been rewound; re-verify the repaired log against the freshest anchor you track yourself.
+    - A torn rotation entry is a torn manifest tail; call rotate_manifest_key again after the repair.
     - Anything else raises and changes nothing.
 
     `previous_signers` covers a retired signing key during rotation (see module docstring)."""
@@ -703,7 +806,7 @@ def quarantine_damaged_lines(
         with _flock(quarantine_path, exclusive=not dry_run):
             _require_terminated(quarantine_path)
             if not dry_run:
-                _append_trace(
+                _append_with_rollback(
                     quarantine_path,
                     [_trace_entry(item, raw, path, signer) for item, raw, path in damage],
                     existed=existed,
