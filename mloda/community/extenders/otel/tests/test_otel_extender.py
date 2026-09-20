@@ -17,16 +17,13 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock
 
 import pytest
 from mloda.core.abstract_plugins.hook_context import instrument  # no public equivalent yet
 from mloda.steward import Extender, ExtenderHook
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.sdk.trace.sampling import ALWAYS_OFF
 from opentelemetry.trace import StatusCode
 
 from mloda.community.extenders.otel import OtelExtender
@@ -376,8 +373,26 @@ class TestOtelExtenderNoSdkProviderWarning:
         assert _marker_records(caplog) == []
 
 
-class TestOtelExtenderInertContentCapture:
-    def test_inert_extender_never_calls_mask(self) -> None:
+class TestOtelExtenderNonRecordingContentCapture:
+    @pytest.mark.parametrize(
+        ("use_sdk_defaults", "inject_provider", "carrier"),
+        [
+            (False, False, None),
+            (True, False, None),
+            # A remote parent with the sampled flag unset (-00): the default ParentBased sampler drops the span.
+            (False, True, {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00"}),
+        ],
+        ids=["inert", "ambient_api_default", "unsampled_parent"],
+    )
+    def test_non_recording_span_never_calls_mask(
+        self,
+        ambient_provider: _AmbientProvider,
+        otel_capture: tuple[TracerProvider, InMemorySpanExporter],
+        use_sdk_defaults: bool,
+        inject_provider: bool,
+        carrier: dict[str, str] | None,
+    ) -> None:
+        provider, exporter = otel_capture
         calls = 0
 
         def mask(_value: Any) -> Any:
@@ -385,83 +400,20 @@ class TestOtelExtenderInertContentCapture:
             calls += 1
             return _value
 
-        otel = OtelExtender(capture_content=True, mask=mask)
-        context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        otel = OtelExtender(
+            capture_content=True,
+            mask=mask,
+            tracer_provider=provider if inject_provider else None,
+            use_sdk_defaults=use_sdk_defaults,
+        )
+        context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, carrier=carrier)
 
         with context.activate():
             result = otel(lambda: [1, 2, 3])
 
         assert result == [1, 2, 3]
         assert calls == 0
-
-
-@pytest.fixture
-def dropping_capture() -> Iterator[tuple[TracerProvider, InMemorySpanExporter]]:
-    """Like otel_capture, but the SDK provider's ALWAYS_OFF sampler drops every span (non-recording)."""
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider(sampler=ALWAYS_OFF, shutdown_on_exit=False)
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    yield provider, exporter
-    provider.shutdown()
-
-
-class TestOtelExtenderNonRecordingContentCapture:
-    """With content capture enabled, a non-recording span must never run the user mask (which may be
-    costly or side-effecting) nor build a preview; a recording span is unchanged."""
-
-    @pytest.mark.parametrize("default_provider_class", [trace.ProxyTracerProvider, trace.NoOpTracerProvider])
-    def test_ambient_api_default_provider_never_calls_mask(
-        self, ambient_provider: _AmbientProvider, default_provider_class: type[trace.TracerProvider]
-    ) -> None:
-        ambient_provider.provider = default_provider_class()
-        mask = Mock(return_value="masked")
-        otel = OtelExtender(capture_content=True, mask=mask, use_sdk_defaults=True)
-        context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
-
-        with context.activate():
-            result = otel(lambda: [1, 2, 3])
-
-        assert result == [1, 2, 3]
-        assert mask.call_count == 0
-
-    def test_sampled_out_sdk_span_never_calls_mask_and_sets_no_preview(
-        self, dropping_capture: tuple[TracerProvider, InMemorySpanExporter]
-    ) -> None:
-        provider, exporter = dropping_capture
-        mask = Mock(return_value="masked")
-        otel = OtelExtender(capture_content=True, mask=mask, tracer_provider=provider)
-        context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
-
-        with context.activate():
-            result = otel(lambda: [1, 2, 3])
-
-        assert result == [1, 2, 3]
-        assert mask.call_count == 0
-        # Self-check: the sampler really dropped the span, so nothing was recorded or exported.
         assert exporter.get_finished_spans() == ()
-
-    @pytest.mark.parametrize("via_ambient", [False, True], ids=["injected", "ambient_sdk_defaults"])
-    def test_recording_span_still_calls_mask_once_and_sets_preview(
-        self,
-        ambient_provider: _AmbientProvider,
-        otel_capture: tuple[TracerProvider, InMemorySpanExporter],
-        via_ambient: bool,
-    ) -> None:
-        provider, exporter = otel_capture
-        mask = Mock(return_value="masked")
-        if via_ambient:
-            ambient_provider.provider = provider
-            otel = OtelExtender(capture_content=True, mask=mask, use_sdk_defaults=True)
-        else:
-            otel = OtelExtender(capture_content=True, mask=mask, tracer_provider=provider)
-        context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
-
-        with context.activate():
-            result = otel(lambda: [1, 2, 3])
-
-        assert result == [1, 2, 3]
-        assert mask.call_count == 1
-        assert "masked" in str(single_span_attributes(exporter)[_CONTENT_ATTRIBUTE])
 
 
 class TestOtelExtenderPickling:
