@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import pickle  # nosec
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -487,6 +487,54 @@ class TestMakeRealWorkerExtenderAndMarkerMustBeDeclared:
             _UndeclaredHost().test_contract_real_worker_multiprocessing_emits_into_the_exact_injected_sink(
                 tmp_path, request, caplog
             )
+
+
+class _AmbientSinkHost(ExtenderContractTestMixin):
+    """Fake ambient-sink host: the spy yields [sink] and _ProbeExtender emits into that sink.
+    Does not override ambient_sink_captured."""
+
+    def __init__(self) -> None:
+        self.sink: list[str] = []
+
+    @classmethod
+    def extender_class(cls) -> type[Extender]:
+        return _ProbeExtender
+
+    @classmethod
+    def has_backend_sink(cls) -> bool:
+        return True
+
+    def make_extender(self, *, raise_on_error: bool | None = None) -> _ProbeExtender:
+        return _ProbeExtender(sink=[])
+
+    def make_sdk_defaults_extender(self) -> Extender:
+        return _ProbeExtender(sink=self.sink)
+
+    def sink_resolution_spy(self) -> AbstractContextManager[list[Any]]:
+        return nullcontext([self.sink])
+
+
+class TestAmbientSinkCaptured:
+    def test_default_is_none(self) -> None:
+        assert ExtenderContractTestMixin().ambient_sink_captured([]) is None
+
+    def test_host_without_override_opts_out_of_the_emission_check(self) -> None:
+        _AmbientSinkHost().test_contract_sdk_defaults_resolves_sink()
+
+    def test_empty_capture_fails_the_sdk_defaults_test(self) -> None:
+        class _EmptyCaptureHost(_AmbientSinkHost):
+            def ambient_sink_captured(self, spy: list[Any]) -> list[Any] | None:
+                return []
+
+        with pytest.raises(AssertionError):
+            _EmptyCaptureHost().test_contract_sdk_defaults_resolves_sink()
+
+    def test_non_empty_capture_read_after_the_extender_call_passes_the_sdk_defaults_test(self) -> None:
+        class _CapturingHost(_AmbientSinkHost):
+            def ambient_sink_captured(self, spy: list[Any]) -> list[Any] | None:
+                return [item for sink in spy for item in sink]
+
+        _CapturingHost().test_contract_sdk_defaults_resolves_sink()
 
 
 class TestCountingExtender:

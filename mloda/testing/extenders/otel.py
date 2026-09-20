@@ -63,10 +63,10 @@ def inject_parent_carrier() -> tuple[dict[str, str], int, int]:
 def _tracer_provider_resolution_spy() -> Iterator[list[Any]]:
     """trace.get_tracer only falls through to get_tracer_provider when tracer_provider is None."""
     calls: list[Any] = []
-    provider, _ = make_span_capture()
+    provider, exporter = make_span_capture()
 
     def spy_get_tracer_provider() -> TracerProvider:
-        calls.append(provider)
+        calls.append(exporter)
         return provider
 
     with patch("opentelemetry.trace.get_tracer_provider", side_effect=spy_get_tracer_provider):
@@ -190,6 +190,9 @@ class OtelExtenderTestMixin(ExtenderContractTestMixin):
 
     def sink_resolution_spy(self) -> AbstractContextManager[list[Any]]:
         return _tracer_provider_resolution_spy()
+
+    def ambient_sink_captured(self, spy: list[Any]) -> list[Any] | None:
+        return [span for exporter in spy for span in exporter.get_finished_spans()]
 
     @classmethod
     def supports_pickled_sink_capture(cls) -> bool:

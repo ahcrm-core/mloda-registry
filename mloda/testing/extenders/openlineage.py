@@ -149,8 +149,9 @@ def _client_init_resolution_spy() -> Iterator[list[Any]]:
     def spy_init(self: OpenLineageClient, *args: Any, **kwargs: Any) -> None:
         bound = signature.bind_partial(self, *args, **kwargs)
         if bound.arguments.get("transport") is None:
-            calls.append(True)
-            bound.arguments["transport"] = RecordingTransport()
+            transport = RecordingTransport()
+            calls.append(transport)
+            bound.arguments["transport"] = transport
         original_init(*bound.args, **bound.kwargs)
 
     with patch.object(OpenLineageClient, "__init__", spy_init):
@@ -195,6 +196,9 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
 
     def sink_resolution_spy(self) -> AbstractContextManager[list[Any]]:
         return _client_init_resolution_spy()
+
+    def ambient_sink_captured(self, spy: list[Any]) -> list[Any] | None:
+        return [event for transport in spy for event in transport.events]
 
     @classmethod
     def supports_pickled_sink_capture(cls) -> bool:

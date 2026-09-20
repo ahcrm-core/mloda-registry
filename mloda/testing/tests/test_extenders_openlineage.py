@@ -338,3 +338,45 @@ class TestOwnFailureDefaultDetectsNoFault:
 
         with pytest.raises(AssertionError, match="own_failure"):
             _Host().test_contract_own_failure_does_not_stop_chained_extender(caplog)
+
+
+class _ClientOnlyProbeOpenLineageExtender(Extender):
+    """Mutant: with use_sdk_defaults it builds an OpenLineageClient (resolving the ambient sink) but never emits."""
+
+    def __init__(
+        self,
+        client: OpenLineageClient | None = None,
+        raise_on_error: bool = False,
+        use_sdk_defaults: bool = False,
+    ) -> None:
+        self.raise_on_error = raise_on_error
+        self.use_sdk_defaults = use_sdk_defaults
+        self._client = client
+
+    def wraps(self) -> set[ExtenderHook]:
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+
+    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        if self._client is None and self.use_sdk_defaults:
+            self._client = OpenLineageClient()
+        return func(*args, **kwargs)
+
+
+class TestSdkDefaultsMustEmitIntoAmbientSink:
+    """Proves the sdk-defaults contract test fails an extender that builds the ambient client but never emits."""
+
+    def test_client_built_without_emission_fails_loudly(self) -> None:
+        class _Host(OpenLineageExtenderTestMixin):
+            @classmethod
+            def extender_class(cls) -> type[Extender]:
+                return _ClientOnlyProbeOpenLineageExtender
+
+            def make_openlineage_extender(
+                self, client: OpenLineageClient, *, raise_on_error: bool | None = None
+            ) -> Extender:
+                if raise_on_error is None:
+                    return _ClientOnlyProbeOpenLineageExtender(client=client)
+                return _ClientOnlyProbeOpenLineageExtender(client=client, raise_on_error=raise_on_error)
+
+        with pytest.raises(AssertionError):
+            _Host().test_contract_sdk_defaults_resolves_sink()
