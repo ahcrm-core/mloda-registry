@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from collections.abc import Mapping
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
 from mloda.steward import Extender, ExtenderHook, HookContext
+
+from mloda.enterprise.extenders.audit._records import _append_records as _append_records
+from mloda.enterprise.extenders.audit._records import _canonical_json as _canonical_json
+from mloda.enterprise.extenders.audit._records import _is_blank, _utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -23,26 +24,18 @@ class AuditSink(Protocol):
     def write(self, record: Mapping[str, Any]) -> None: ...
 
 
-def _is_missing(value: str | None) -> bool:
-    """A required identity value is missing when it is None or blank."""
-    return value is None or not value.strip()
-
-
 class NdjsonAuditSink:
     """One os.write per record to an O_APPEND descriptor keeps concurrent writers from interleaving
     a line, and the file is created owner-only. Opens per write, so it pickles and holds no buffer a
-    terminated worker could lose; ordering across writers is not guaranteed."""
+    terminated worker could lose; ordering across writers is not guaranteed. A short write raises
+    instead of finishing the line, leaving a torn line that blocks sealing and verification until
+    quarantine_damaged_lines repairs it."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
     def write(self, record: Mapping[str, Any]) -> None:
-        line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-        fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(fd, line)
-        finally:
-            os.close(fd)
+        _append_records(self.path, [record])
 
 
 class AuditExtender(Extender):
@@ -104,11 +97,10 @@ class AuditExtender(Extender):
         return result
 
     def _build_record(self, context: HookContext, *, status: str | None, error_type: str | None) -> dict[str, Any]:
-        missing = [name for name in self.required_identity if _is_missing(getattr(context, name))]
+        missing = [name for name in self.required_identity if _is_blank(getattr(context, name))]
         return {
             "record_version": 1,
-            # Audit records require the explicit Z, unlike OpenLineage's +00:00 offset.
-            "event_time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "event_time": _utc_now(),
             "run_id": context.run_id,
             "tenant_id": context.tenant_id,
             "project_id": context.project_id,
