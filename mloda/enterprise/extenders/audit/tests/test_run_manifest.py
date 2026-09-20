@@ -168,6 +168,15 @@ def _verify_only(private_key: bytes = _KEY, key_id: str = "key-1") -> Ed25519Sig
     return Ed25519Signer.from_public_key(_public_key(private_key), key_id)
 
 
+# Signatures that are not a str at all, one of which is the valid signature as bytes.
+_NON_STR_SIGNATURES: dict[str, Callable[[str], Any]] = {
+    "none": lambda signature: None,
+    "bytes": lambda signature: signature.encode("ascii"),
+    "int": lambda signature: 123,
+    "list": lambda signature: ["a"],
+}
+
+
 def _record(run_id: str | None = "run-1", second: int = 0, *, tenant_id: str | None = "tenant-1") -> dict[str, Any]:
     compliant = tenant_id is not None
     return {
@@ -678,6 +687,16 @@ class TestManifestSignerContract:
     def test_verify_returns_false_for_a_signature_it_cannot_compare(self, signature: str) -> None:
         assert _signer().verify(b"payload", signature) is False
 
+    @pytest.mark.parametrize("make", list(_NON_STR_SIGNATURES.values()), ids=list(_NON_STR_SIGNATURES))
+    def test_verify_returns_false_and_never_raises_for_a_signature_that_is_not_a_str(
+        self, make: Callable[[str], Any]
+    ) -> None:
+        signer = _signer()
+        # Control: the original verifies.
+        assert signer.verify(b"payload", signer.sign(b"payload")) is True
+
+        assert signer.verify(b"payload", make(signer.sign(b"payload"))) is False
+
     @pytest.mark.parametrize("key_id", ["", "   ", "\t\n"])
     def test_blank_key_id_raises_value_error(self, key_id: str) -> None:
         with pytest.raises(ValueError):
@@ -741,14 +760,6 @@ _MANGLED_SIGNATURES: dict[str, Callable[[str], str]] = {
     "lone-surrogate": lambda signature: chr(0xD800) * len(signature),
 }
 
-# Signatures that are not a str at all, one of which is the valid signature as bytes.
-_NON_STR_SIGNATURES: dict[str, Callable[[str], Any]] = {
-    "none": lambda signature: None,
-    "bytes": lambda signature: signature.encode("ascii"),
-    "int": lambda signature: 123,
-    "list": lambda signature: ["a"],
-}
-
 _not_a_32_byte_key = pytest.mark.parametrize(
     "key", [b"", b"k" * 31, b"k" * 33, "k" * 32], ids=["empty", "31-bytes", "33-bytes", "str"]
 )
@@ -792,13 +803,12 @@ class TestEd25519Signer:
 
         assert signer.verify(b"payload", mangled) is False
 
-    @pytest.mark.parametrize("public_only", [False, True], ids=["private", "public-only"])
     @pytest.mark.parametrize("make", list(_NON_STR_SIGNATURES.values()), ids=list(_NON_STR_SIGNATURES))
-    def test_verify_returns_false_and_never_raises_for_a_signature_that_is_not_a_str(
-        self, make: Callable[[str], Any], public_only: bool
+    def test_a_public_key_signer_returns_false_and_never_raises_for_a_signature_that_is_not_a_str(
+        self, make: Callable[[str], Any]
     ) -> None:
         signature = Ed25519Signer(_KEY, "key-1").sign(b"payload")
-        signer = _verify_only() if public_only else Ed25519Signer(_KEY, "key-1")
+        signer = _verify_only()
         # Control: the original verifies.
         assert signer.verify(b"payload", signature) is True
 

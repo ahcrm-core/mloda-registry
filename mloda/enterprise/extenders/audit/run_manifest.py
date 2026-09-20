@@ -98,6 +98,8 @@ class HmacSha256Signer:
         return hmac.new(self._key, payload, hashlib.sha256).hexdigest()
 
     def verify(self, payload: bytes, signature: str) -> bool:
+        if not isinstance(signature, str):
+            return False
         # compare_digest raises TypeError on a non-ASCII str.
         return signature.isascii() and hmac.compare_digest(self.sign(payload), signature)
 
