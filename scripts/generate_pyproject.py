@@ -164,6 +164,17 @@ def resolve_optional_dependencies(
     }
 
 
+def sibling_dependency_names(deps: list[str], all_packages: dict[str, dict[str, Any]]) -> list[str]:
+    """Return the configured package names (as spelled in config) that ``deps`` name, extras and markers ignored."""
+    configured = {normalize_package_name(name): name for name in all_packages}
+    names: set[str] = set()
+    for dep in deps:
+        match = DEP_NAME_RE.match(dep.split(";", 1)[0])
+        if match is not None and normalize_package_name(match.group(1)) in configured:
+            names.add(configured[normalize_package_name(match.group(1))])
+    return sorted(names)
+
+
 def nested_package_names(pkg_path: str, all_packages: dict[str, dict[str, Any]]) -> list[str]:
     """Return the configured packages whose path is nested under ``pkg_path``, in config order."""
     prefix = pkg_path.rstrip("/") + "/"
@@ -324,6 +335,7 @@ def generate_pyproject(
     # Resolved early so a missing version raises this function's own ValueError, not a raw KeyError.
     defaults = shared.get("defaults", {})
     deps = resolve_dependencies(pkg_name, pkg_config.get("dependencies", []), shared, all_packages)
+    runtime_deps = list(deps)  # `deps` is rebound by the optional-dependencies loop below
 
     lines = [HEADER]
 
@@ -449,10 +461,16 @@ def generate_pyproject(
         for dep in pkg_config["workspace_deps"]:
             lines.append(f"{quote_toml_basic_string(dep, key=True)} = {{ workspace = true }}")
         lines.append("")
-    elif gets_default_dev_deps and depth <= 2:
-        lines.append("[tool.uv.sources]")
-        lines.append(f"{quote_toml_basic_string('mloda-testing', key=True)} = {{ workspace = true }}")
-        lines.append("")
+    elif depth <= 2:
+        # uv resolves a workspace dependency of a top-level member only through a source entry.
+        source_names = set(sibling_dependency_names(runtime_deps, all_packages))
+        if gets_default_dev_deps:
+            source_names.add("mloda-testing")
+        if source_names:
+            lines.append("[tool.uv.sources]")
+            for source_name in sorted(source_names):
+                lines.append(f"{quote_toml_basic_string(source_name, key=True)} = {{ workspace = true }}")
+            lines.append("")
 
     return "\n".join(lines)
 

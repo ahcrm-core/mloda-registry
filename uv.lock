@@ -1838,6 +1838,7 @@ version = "0.4.7"
 source = { editable = "mloda/enterprise" }
 dependencies = [
     { name = "mloda" },
+    { name = "mloda-community-extenders-shared" },
 ]
 
 [package.optional-dependencies]
@@ -1849,6 +1850,7 @@ ed25519 = [
 requires-dist = [
     { name = "cryptography", marker = "extra == 'ed25519'", specifier = ">=42" },
     { name = "mloda", specifier = ">=0.13.0,<0.14.0" },
+    { name = "mloda-community-extenders-shared", editable = "mloda/community/extenders/shared" },
 ]
 provides-extras = ["ed25519"]
 
@@ -1858,6 +1860,7 @@ version = "0.4.7"
 source = { editable = "mloda/enterprise/extenders/audit" }
 dependencies = [
     { name = "mloda" },
+    { name = "mloda-community-extenders-shared" },
 ]
 
 [package.optional-dependencies]
@@ -1871,6 +1874,7 @@ dev = [
 requires-dist = [
     { name = "cryptography", marker = "extra == 'dev'", specifier = ">=42" },
     { name = "mloda", specifier = ">=0.13.0,<0.14.0" },
+    { name = "mloda-community-extenders-shared", specifier = ">=0.4.7" },
     { name = "mloda-testing", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
 ]

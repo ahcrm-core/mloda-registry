@@ -1202,6 +1202,35 @@ class TestOpenLineageExtenderInputDataLoadCorrelation:
             for r in debug_records
         ), debug_records
 
+    def test_stack_is_restored_after_a_calculate_that_raises(
+        self, ol_capture: tuple[OpenLineageClient, RecordingTransport], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client, transport = ol_capture
+        extender = OpenLineageExtender(client=client)
+
+        def failing_body() -> None:
+            raise RuntimeError("calculate boom")
+
+        with make_hook_context().activate():
+            with pytest.raises(RuntimeError, match="calculate boom"):
+                extender(failing_body)
+        events_after_failure = len(transport.events)
+
+        with caplog.at_level(logging.DEBUG):
+            with make_hook_context(hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity="standalone").activate():
+                result = extender(lambda: "loaded")
+
+        assert result == "loaded"
+        assert len(transport.events) == events_after_failure
+
+        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any(
+            "OpenLineageExtender" in r.message
+            and "calculate" in r.message.lower()
+            and ("enclosing" in r.message.lower() or "open" in r.message.lower())
+            for r in debug_records
+        ), debug_records
+
 
 class TestOpenLineageExtenderPerInstanceAttribution:
     """Nested INPUT_DATA_LOAD must attribute to its own enclosing instance, not any open one."""
@@ -1235,6 +1264,33 @@ class TestOpenLineageExtenderPerInstanceAttribution:
             assert inputs is not None
             assert len(inputs) == 1
             assert inputs[0].name == "s3://bucket/key.parquet"
+
+    def test_nested_calculate_attributes_each_load_to_its_own_level(
+        self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
+    ) -> None:
+        client, transport = ol_capture
+        extender = OpenLineageExtender(client=client)
+        outer_class = "mloda.testing.OuterFeatureGroup"
+        inner_class = "mloda.testing.InnerFeatureGroup"
+
+        def load(identity: str) -> None:
+            with make_hook_context(hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity=identity).activate():
+                extender(lambda: "loaded")
+
+        def inner_body() -> None:
+            load("s3://bucket/inner.parquet")
+
+        def outer_body() -> None:
+            with make_hook_context(feature_group_class=inner_class).activate():
+                extender(inner_body)
+            load("s3://bucket/outer.parquet")
+
+        with make_hook_context(feature_group_class=outer_class).activate():
+            extender(outer_body)
+
+        complete_by_job = {e.job.name: e for e in transport.events if e.eventType == RunState.COMPLETE}
+        assert [i.name for i in complete_by_job[inner_class].inputs or []] == ["s3://bucket/inner.parquet"]
+        assert [i.name for i in complete_by_job[outer_class].inputs or []] == ["s3://bucket/outer.parquet"]
 
 
 class TestOpenLineageExtenderInputDedupe:
