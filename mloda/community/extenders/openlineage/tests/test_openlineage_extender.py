@@ -1267,6 +1267,32 @@ class TestOpenLineageExtenderInputDedupe:
         assert complete_event.inputs is not None
         assert len(complete_event.inputs) == 1
 
+    def test_input_feature_matching_a_data_load_identity_is_reported_once(
+        self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
+    ) -> None:
+        client, transport = ol_capture
+        extender = OpenLineageExtender(client=client, dataset_namespace="custom-ds")
+        inner_context = make_hook_context(hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity="shared")
+
+        def inner_loader() -> str:
+            return "loaded-data"
+
+        def calculate_body() -> str:
+            with inner_context.activate():
+                extender(inner_loader)
+            return "calculated"
+
+        with make_hook_context(input_features=frozenset({"shared", "other"})).activate():
+            extender(calculate_body)
+
+        complete_event = transport.events[-1]
+        assert complete_event.eventType == RunState.COMPLETE
+        assert complete_event.inputs is not None
+        assert sorted((i.namespace, i.name) for i in complete_event.inputs) == [
+            ("custom-ds", "other"),
+            ("custom-ds", "shared"),
+        ]
+
 
 class TestOpenLineageExtenderRunAll:
     """End-to-end wiring through mloda.user.mloda.run_all: RunEvents carry the real feature group's job name."""

@@ -514,14 +514,16 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
                 extender(lambda: "loaded-data")
             raise RuntimeError("inner boom")
 
-        with make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE).activate():
+        with make_hook_context(
+            hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, input_features=frozenset({"text"})
+        ).activate():
             with pytest.raises(RuntimeError, match="inner boom"):
                 extender(outer_func)
 
         fail_event = transport.events[-1]
         assert fail_event.eventType == RunState.FAIL
         assert fail_event.inputs is not None
-        assert [i.name for i in fail_event.inputs] == ["s3://bucket/key.parquet"]
+        assert sorted(i.name for i in fail_event.inputs) == ["s3://bucket/key.parquet", "text"]
 
     def test_openlineage_failing_input_data_load_is_still_attributed_on_fail(self) -> None:
         client, transport = make_recording_client()
@@ -611,6 +613,16 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
         assert complete_event.inputs is not None
         assert len(complete_event.inputs) == 1
         assert complete_event.inputs[0].name == str(csv_paths[0])
+
+    def test_openlineage_run_all_derived_feature_reports_input_feature(self) -> None:
+        client, transport = make_recording_client()
+        run_two_features(self.make_openlineage_extender(client))
+
+        complete_events = [event for event in transport.events if event.eventType == RunState.COMPLETE]
+        derived_events = [event for event in complete_events if event.inputs]
+        assert len(derived_events) == 1
+        assert sorted(i.name for i in derived_events[0].inputs or []) == ["value_int"]
+        assert all(not event.inputs for event in complete_events if event is not derived_events[0])
 
     def test_openlineage_facet_producers_match_event_producer(self) -> None:
         client, transport = make_recording_client()
