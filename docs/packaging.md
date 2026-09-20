@@ -250,7 +250,7 @@ dependency (today `cryptography` behind `mloda-enterprise[ed25519]`, used by `ml
 1. Add the extra to the bundle's `optional_dependencies` in `config/packages.toml`. For
    `mloda-community`, also add it to the `all` extra.
 2. Add the same specifier to the leaf's `optional_dependencies.dev`, not its `dependencies`, which
-   is for a plugin that cannot load without it. tox syncs only member `dev` extras.
+   is for a plugin that cannot load without it.
 3. Regenerate, run `uv lock` and commit `uv.lock`, as in
    [Add a test-only dependency](#add-a-test-only-dependency).
 4. If tests `importorskip` the dependency, add its import name to `REQUIRED_TEST_DEPENDENCIES` in
