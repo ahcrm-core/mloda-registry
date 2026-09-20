@@ -196,6 +196,25 @@ class TestOtelExtenderTestMixinShape:
     def test_expected_span_names_defaults_to_none(self) -> None:
         assert OtelExtenderTestMixin.expected_span_names() is None
 
+    def test_ambient_sink_captured_reads_finished_spans_from_the_spy_exporters(self) -> None:
+        provider, exporter = make_span_capture()
+        with provider.get_tracer("test-extenders-otel").start_as_current_span("probe-span"):
+            pass
+
+        mixin = OtelExtenderTestMixin()
+        captured = mixin.ambient_sink_captured([exporter])
+        assert captured is not None
+        assert [span.name for span in captured] == ["probe-span"]
+        assert mixin.ambient_sink_captured([]) == []
+
+    def test_sdk_defaults_contract_fails_when_the_ambient_sink_captured_nothing(self) -> None:
+        class _Host(TestProbeOtelExtenderContract):
+            def ambient_sink_captured(self, spy: list[Any]) -> list[Any] | None:
+                return []
+
+        with pytest.raises(AssertionError):
+            _Host().test_contract_sdk_defaults_resolves_sink()
+
 
 class TestProbeOtelExtenderContract(OtelExtenderTestMixin):
     """Self-test: _ProbeOtelExtender must satisfy every OTel contract test the mixin defines."""
@@ -277,45 +296,3 @@ class TestOwnFailureDefaultDetectsNoFault:
 
         with pytest.raises(AssertionError, match="own_failure"):
             _Host().test_contract_own_failure_does_not_stop_chained_extender(caplog)
-
-
-class _LookupOnlyOtelExtender(Extender):
-    """Mutant: with use_sdk_defaults it looks up the ambient tracer provider (a diagnostic probe) but never emits."""
-
-    def __init__(
-        self,
-        tracer_provider: TracerProvider | None = None,
-        raise_on_error: bool = False,
-        use_sdk_defaults: bool = False,
-    ) -> None:
-        self.raise_on_error = raise_on_error
-        self.use_sdk_defaults = use_sdk_defaults
-        self._tracer_provider = tracer_provider
-
-    def wraps(self) -> set[ExtenderHook]:
-        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
-
-    def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
-        if self.use_sdk_defaults:
-            trace.get_tracer_provider()
-        return func(*args, **kwargs)
-
-
-class TestSdkDefaultsMustEmitIntoAmbientSink:
-    """Proves the sdk-defaults contract test fails an extender that resolves the ambient provider but never emits."""
-
-    def test_lookup_without_emission_fails_loudly(self) -> None:
-        class _Host(OtelExtenderTestMixin):
-            @classmethod
-            def extender_class(cls) -> type[Extender]:
-                return _LookupOnlyOtelExtender
-
-            def make_otel_extender(
-                self, tracer_provider: TracerProvider, *, raise_on_error: bool | None = None
-            ) -> Extender:
-                if raise_on_error is None:
-                    return _LookupOnlyOtelExtender(tracer_provider=tracer_provider)
-                return _LookupOnlyOtelExtender(tracer_provider=tracer_provider, raise_on_error=raise_on_error)
-
-        with pytest.raises(AssertionError):
-            _Host().test_contract_sdk_defaults_resolves_sink()
