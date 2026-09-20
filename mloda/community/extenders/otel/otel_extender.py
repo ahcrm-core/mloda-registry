@@ -187,7 +187,7 @@ class OtelExtender(Extender):
                 if context is not None and context.hook == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE:
                     if context.rows_out is not None:
                         span.set_attribute("mloda.rows.out", context.rows_out)
-                    if tracer_provider is not _NOOP_TRACER_PROVIDER and self._content_capture_enabled():
+                    if span.is_recording() and self._content_capture_enabled():
                         span.set_attribute("mloda.content.preview", self._content_preview(result))
             except Exception as exc:
                 logger.warning("OtelExtender post-call instrumentation failed: %s: %s", type(exc).__name__, exc)
