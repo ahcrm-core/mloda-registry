@@ -249,21 +249,21 @@ dependency (today `cryptography` behind `mloda-enterprise[ed25519]`, used by `ml
 
 1. Add the extra to the bundle's `optional_dependencies` in `config/packages.toml`. For
    `mloda-community`, also add it to the `all` extra.
-2. Add the same specifier to the leaf's `optional_dependencies.dev`, not its `dependencies`, which
-   is for a plugin that cannot load without it.
+2. Add the same specifier to the leaf's `optional_dependencies.dev`, repeating the default `dev`
+   entries (a package's `dev` replaces them). Not its `dependencies`: a bundle install never reads them.
 3. Regenerate, run `uv lock` and commit `uv.lock`, as in
    [Add a test-only dependency](#add-a-test-only-dependency).
-4. If tests `importorskip` the dependency, add its import name to `REQUIRED_TEST_DEPENDENCIES` in
+4. If a test imports the dependency, add its import name to `REQUIRED_TEST_DEPENDENCIES` in
    `tests/test_end2end/test_dev_dependencies.py`.
 5. Add the install row to the README and to the install table under
    [Individual packages](#individual-packages).
 
 Keep the floor in the bundle extra and in the leaf `dev` entry equal. Nothing enforces that pair:
 `test_mloda_community_declares_extra_matching_pin_source` only compares a bundle extra with a
-published leaf's `dependencies`.
+leaf's `dependencies`.
 
 ### Add a variant to an existing plugin
 
-Same as above, plus add the variant to the parent's `optional_dependencies.all`.
+Same as [Add a new package](#add-a-new-package), plus add the variant to the parent's `optional_dependencies.all`.
 If that extra is `["{published_children}"]`, do not edit it: set `published = true`
 on the variant instead, and the placeholder picks it up.
