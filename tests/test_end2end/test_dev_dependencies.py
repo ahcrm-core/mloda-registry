@@ -1,9 +1,9 @@
 """Tests that verify all expected optional test dependencies are installed.
 
 These tests prevent silent test skipping: if a dependency listed here is
-missing from the dev extras in pyproject.toml, the test suite will fail
-loudly instead of silently skipping entire test modules via
-``pytest.importorskip``.
+missing from the relevant package's ``optional_dependencies.dev`` in
+``config/packages.toml``, the test suite will fail loudly instead of silently
+skipping entire test modules via ``pytest.importorskip``.
 """
 
 import importlib
@@ -28,15 +28,17 @@ REQUIRED_TEST_DEPENDENCIES = [
 def test_required_test_dependency_is_installed(module_name: str) -> None:
     """Each framework dependency must be importable in the test environment.
 
-    If this test fails, add the missing package to the ``dev`` extras in
-    the root ``pyproject.toml``.
+    If this test fails, add the missing package to the relevant package's
+    ``optional_dependencies.dev`` in ``config/packages.toml``. Then run
+    ``python scripts/generate_pyproject.py`` followed by ``uv lock``.
     """
     try:
         importlib.import_module(module_name)
     except ImportError:
         pytest.fail(
             f"Required test dependency '{module_name}' is not installed. "
-            f"Add it to [project.optional-dependencies] dev in the root pyproject.toml."
+            "Add it to the relevant package's optional_dependencies.dev in config/packages.toml, "
+            "run python scripts/generate_pyproject.py, then run uv lock."
         )
 
 
@@ -70,5 +72,6 @@ def test_framework_tests_are_not_skipped(framework: str, module_path: str) -> No
     except pytest.skip.Exception:
         pytest.fail(
             f"{framework} test module was skipped at import time. "
-            f"{framework} is not installed; add it to [project.optional-dependencies] dev."
+            f"{framework} is not installed; add it to the relevant package's optional_dependencies.dev in "
+            "config/packages.toml, run python scripts/generate_pyproject.py, then run uv lock."
         )
