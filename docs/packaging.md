@@ -60,7 +60,7 @@ optional_dependencies = { dev = ["mloda-testing", "pytest>=9.0.3"] }
 |-------|----------|-------------|
 | `description` | Yes | PyPI description |
 | `path` | Yes | Package directory |
-| `published` | No | `true` ships the distribution standalone on PyPI. Single source of the released set, read through `scripts/published_packages.py`. Must be a boolean, and governs the released set only, never wheel contents |
+| `published` | No | `true` ships the distribution standalone on PyPI. Single source of the released set, read through `scripts/published_packages.py`. Must be a boolean. It governs the released set, and also wheel contents through the bundle dependency guard: a bundle never ships a nested published package it lists in its own `dependencies` |
 | `dependencies` | By convention | Runtime deps; use `"{core_dependency}"` for the mloda floor, `"<sibling>>={version}"` for a sibling package (see [Sibling dependency floors](#sibling-dependency-floors)). The generator defaults it to empty rather than failing, but every package declares it |
 | `optional_dependencies` | No | Merged with defaults. The entry `"{published_children}"` expands to every published package nested under this package's path, in config order. A test-only third-party dependency goes in `dev` here; see [Add a test-only dependency](#add-a-test-only-dependency) |
 | `has_readme` | No | `true` points the package at its own `README.md` |
@@ -95,7 +95,8 @@ configured sibling package; any other use of `{version}` fails generation.
 - `license` from path (`mloda/enterprise/*` → proprietary, else default)
 - `packages` from filesystem (scans for `__init__.py`, excludes `tests/`, `build/`, etc.)
 - wheel boundaries from the layout: a nested package stays out of its parent's wheel,
-  published or not; `entry_point_bundle` packages ship all nested code
+  published or not; `entry_point_bundle` packages ship all nested code except a nested
+  package listed in their own `dependencies`, which that package owns
 
 **Default dev deps skipped for:** `mloda-testing`, `mloda-community`, `mloda-enterprise`
 
@@ -106,16 +107,18 @@ configured sibling package; any other use of `{version}` fails generation.
 `mloda-community` and `mloda-enterprise` include all sub-package code directly, so
 one install gets every plugin and nothing depends on an unpublished sub-package.
 Many sub-packages can also be published separately for granular installs, but not
-all are; see [Releasing](releasing.md). A bundle's wheel ships only its own path, so a
-nested plugin that imports a sibling outside that path (`mloda-enterprise-audit` uses
-`mloda-community-extenders-shared`) needs that sibling in the bundle's own `dependencies`.
+all are; see [Releasing](releasing.md). A nested plugin that imports a sibling outside the
+bundle's path (`mloda-enterprise-audit` uses `mloda-community-extenders-shared`) needs that
+sibling in the bundle's own `dependencies`. If the sibling is nested in the bundle (as for
+`mloda-community`), it must be `published = true` with no `entry_point_groups`, and its own
+wheel ships it instead of the bundle's.
 
 ```text
 mloda-community (bundled)
   └── includes: mloda.community.*
         ├── feature_groups/*
         ├── compute_frameworks/*
-        └── extenders/*
+        └── extenders/*   (except extenders/shared, owned by mloda-community-extenders-shared)
 ```
 
 A bundled plugin whose runtime dependency is heavy sits behind a bundle extra instead of a

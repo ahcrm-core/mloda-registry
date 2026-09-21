@@ -262,7 +262,7 @@ def verify_dependency_relationships(wheels: dict[str, Path]) -> list[str]:
 
     Note: mloda-community and mloda-enterprise are bundled packages that include
     all sub-package code directly, so they don't have dependencies on sub-packages
-    (except on a sibling outside their path).
+    (except on a nested published sub-package, or a sibling outside their path).
     """
     errors = []
 
@@ -289,6 +289,15 @@ def verify_dependency_relationships(wheels: dict[str, Path]) -> list[str]:
             errors.append("mloda-community-example-b: missing dependency on mloda-community-example")
 
     return errors
+
+
+def verify_shared_wheel_has_single_owner(wheels: dict[str, Path]) -> list[str]:
+    """Verify no path appears in both the mloda-community wheel and the shared extenders wheel."""
+    bundle, shared = "mloda-community", "mloda-community-extenders-shared"
+    if bundle not in wheels or shared not in wheels:
+        return []
+    overlap = sorted(set(get_wheel_files(wheels[bundle])) & set(get_wheel_files(wheels[shared])))
+    return [f"{bundle} and {shared} wheels both ship {path}" for path in overlap]
 
 
 def verify_pep420_source_compliance() -> list[str]:
@@ -343,7 +352,7 @@ def cleanup_egg_info() -> int:
 
 def main() -> int:
     # Stale build/ trees from a previous run would be copied into this run's wheels
-    stale = cleanup_build_dirs()
+    stale = cleanup_build_dirs() + cleanup_egg_info()
     if stale:
         print(f"🧹 Removed {stale} stale build directory(ies)")
 
@@ -393,6 +402,14 @@ def main() -> int:
             errors.extend(dep_errors)
         else:
             print("  ✓ package dependencies correct")
+
+        # Verify the shared extenders files have a single owning wheel
+        print("\nVerifying shared file ownership...")
+        overlap_errors = verify_shared_wheel_has_single_owner(built_wheels)
+        if overlap_errors:
+            errors.extend(overlap_errors)
+        else:
+            print("  ✓ shared files owned by one wheel")
 
         # Verify wheel metadata (top_level.txt, namespace compliance)
         print("\nVerifying wheel metadata...")
