@@ -106,7 +106,9 @@ configured sibling package; any other use of `{version}` fails generation.
 `mloda-community` and `mloda-enterprise` include all sub-package code directly, so
 one install gets every plugin and nothing depends on an unpublished sub-package.
 Many sub-packages can also be published separately for granular installs, but not
-all are; see [Releasing](releasing.md).
+all are; see [Releasing](releasing.md). A bundle's wheel ships only its own path, so a
+nested plugin that imports a sibling outside that path (`mloda-enterprise-audit` uses
+`mloda-community-extenders-shared`) needs that sibling in the bundle's own `dependencies`.
 
 ```text
 mloda-community (bundled)
@@ -203,9 +205,10 @@ Conventions:
 ## UV workspace sources
 
 The generator adds `mloda-testing = { workspace = true }` only for top-level packages
-(depth <= 2) that receive default dev deps. Nested packages cannot use workspace
-sources due to uv resolution limits; they get dev deps but rely on root workspace
-resolution.
+(depth <= 2) that receive default dev deps, plus one such entry for each sibling in a
+top-level package's runtime `dependencies` (uv will not lock without it). Nested
+packages cannot use workspace sources due to uv resolution limits; they get dev deps
+but rely on root workspace resolution.
 
 ## Common workflows
 

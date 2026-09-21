@@ -4,12 +4,14 @@ With fail_closed=True it also refuses at FEATURE_GROUP_MATCHED, writing a deny r
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
 from mloda.steward import Extender, ExtenderHook, HookContext
 
+from mloda.community.extenders.shared.open_invocations import OpenInvocationStack
 from mloda.enterprise.extenders.audit._records import _append_records as _append_records
 from mloda.enterprise.extenders.audit._records import _canonical_json as _canonical_json
 from mloda.enterprise.extenders.audit._records import _is_blank, _utc_now
@@ -17,6 +19,13 @@ from mloda.enterprise.extenders.audit._records import _is_blank, _utc_now
 logger = logging.getLogger(__name__)
 
 _ALLOWED_IDENTITY_NAMES = ("tenant_id", "project_id", "principal")
+
+_open_calculates: OpenInvocationStack[list[tuple[str, str | None]]] = OpenInvocationStack("audit_open_calculates")
+
+_URI_SCHEME = re.compile(r"[A-Za-z][\w+.:-]*")
+_QUERY_OR_FRAGMENT = re.compile(r"[?#]")
+_PATH_PARAMS = re.compile(r"[;&]")
+_AUTHORITY_LEAK = re.compile(r"[;&=\s]")
 
 
 class AuditSink(Protocol):
@@ -47,6 +56,21 @@ def _error_type(exc: BaseException) -> str:
     return f"{type(exc).__module__}.{type(exc).__qualname__}"
 
 
+def _sanitize_data_access_identity(identity: str) -> str:
+    # Core's own userinfo strip is greedy and can leave query text in the string, so the authority and path
+    # are cut at leak markers too. Userinfo goes first: ; and & are valid inside it.
+    scheme, separator, rest = identity.partition("://")
+    if not separator or not _URI_SCHEME.fullmatch(scheme):
+        return identity
+    rest = _QUERY_OR_FRAGMENT.split(rest, maxsplit=1)[0].rpartition("@")[2]
+    authority, slash, path = rest.partition("/")
+    path = _PATH_PARAMS.split(path, maxsplit=1)[0]
+    cut_authority = _AUTHORITY_LEAK.split(authority, maxsplit=1)[0]
+    if cut_authority != authority:
+        return f"{scheme}://{cut_authority}"
+    return f"{scheme}://{authority}{slash}{path}"
+
+
 class AuditExtender(Extender):
     """Records tenant-scoped audit metadata (never values or exception messages) for every
     calculation. A missing required identity yields a deny record while the calculation still
@@ -54,7 +78,12 @@ class AuditExtender(Extender):
     the run; when the calculation itself fails, its exception wins and the sink failure is only logged.
     With fail_closed=True (needs raise_on_error=True), a missing identity writes the deny record and
     raises IdentityRequiredError before the wrapped call, also at FEATURE_GROUP_MATCHED, and runs
-    outermost (priority 0)."""
+    outermost (priority 0).
+    Records also list the distinct data loads the call attempted, as index-aligned identity and format
+    lists ([] for none; a load without an identity is omitted). URI query, fragment, `;` and `&` parameters
+    and user information are stripped, best effort; other identities are recorded as given, so not
+    credential-free, and a sealed log cannot be redacted afterwards. Keys may be added within
+    record_version 1; an absent key means not recorded."""
 
     def __init__(
         self,
@@ -92,12 +121,21 @@ class AuditExtender(Extender):
 
     def wraps(self) -> set[ExtenderHook]:
         if self.fail_closed:
-            return {ExtenderHook.FEATURE_GROUP_MATCHED, ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
-        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+            return {
+                ExtenderHook.FEATURE_GROUP_MATCHED,
+                ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+                ExtenderHook.INPUT_DATA_LOAD,
+            }
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, ExtenderHook.INPUT_DATA_LOAD}
 
     def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         context = HookContext.current()
         if context is None:
+            return func(*args, **kwargs)
+
+        # A load only runs inside a calculate call that already passed the gate.
+        if context.hook is ExtenderHook.INPUT_DATA_LOAD:
+            self._note_load(context, args)
             return func(*args, **kwargs)
 
         if self.fail_closed:
@@ -107,15 +145,17 @@ class AuditExtender(Extender):
                     raise IdentityRequiredError(f"AuditExtender refused the call: missing required identity {missing}")
                 except IdentityRequiredError as refusal:
                     # Unguarded on purpose: a sink failure must propagate (chained to the refusal), never be swallowed.
-                    self.sink.write(self._build_record(context, status="error", error_type=_error_type(refusal)))
+                    self.sink.write(self._build_record(context, [], status="error", error_type=_error_type(refusal)))
                     raise
             if context.hook is ExtenderHook.FEATURE_GROUP_MATCHED:
                 return func(*args, **kwargs)
 
+        loads: list[tuple[str, str | None]] = []
         try:
-            result = func(*args, **kwargs)
+            with _open_calculates.open(self, loads):
+                result = func(*args, **kwargs)
         except BaseException as exc:
-            record = self._build_record(context, status="error", error_type=_error_type(exc))
+            record = self._build_record(context, loads, status="error", error_type=_error_type(exc))
             try:
                 self.sink.write(record)
             except Exception as sink_exc:
@@ -130,14 +170,29 @@ class AuditExtender(Extender):
         # Unguarded on purpose: a sink failure here must propagate (raise_on_error controls the
         # fallback), never be swallowed alongside a result that was already computed successfully.
         # context.status is only set by core's instrument() wrapper; without it, the call still succeeded.
-        record = self._build_record(context, status=context.status or "success", error_type=None)
+        record = self._build_record(context, loads, status=context.status or "success", error_type=None)
         self.sink.write(record)
         return result
+
+    def _note_load(self, context: HookContext, args: tuple[Any, ...]) -> None:
+        loads = _open_calculates.find(self)
+        if loads is None:
+            logger.debug("AuditExtender: INPUT_DATA_LOAD has no enclosing open calculate invocation to attach to")
+            return
+        if context.data_access_identity is None:
+            return
+        # Core passes the raw data_access first; using it avoids core's lossy greedy strip.
+        raw = args[0] if args and isinstance(args[0], str) else context.data_access_identity
+        entry = (_sanitize_data_access_identity(raw), context.data_access_format)
+        if entry not in loads:
+            loads.append(entry)
 
     def _missing_identity(self, context: HookContext) -> list[str]:
         return [name for name in self.required_identity if _is_blank(getattr(context, name))]
 
-    def _build_record(self, context: HookContext, *, status: str | None, error_type: str | None) -> dict[str, Any]:
+    def _build_record(
+        self, context: HookContext, loads: list[tuple[str, str | None]], *, status: str | None, error_type: str | None
+    ) -> dict[str, Any]:
         missing = self._missing_identity(context)
         return {
             "record_version": 1,
@@ -160,4 +215,6 @@ class AuditExtender(Extender):
             "duration_seconds": context.duration_seconds,
             "status": status,
             "error_type": error_type,
+            "data_access_identity": [identity for identity, _ in loads],
+            "data_access_format": [fmt for _, fmt in loads],
         }

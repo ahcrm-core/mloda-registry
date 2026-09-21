@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pyarrow as pa
 import pytest
 from mloda.steward import Extender, ExtenderHook, HookContext
-from mloda.user import ParallelizationMode
+from mloda.user import ParallelizationMode, mloda
 
 from mloda.testing.extenders import runners
 from mloda.testing.extenders.contract import ExtenderContractTestMixin
@@ -257,6 +258,19 @@ class TestRunCsvFeature:
         csv_paths = list(tmp_path.glob("*.csv"))
         assert len(csv_paths) == 1
         assert recorder.identities == [str(csv_paths[0])]
+
+    @pytest.mark.parametrize(
+        ("keyword", "value"),
+        [("parallelization_modes", {ParallelizationMode.THREADING}), ("flight_server", object())],
+        ids=["parallelization_modes", "flight_server"],
+    )
+    def test_forwards_the_run_keywords_to_run_all(self, tmp_path: Path, keyword: str, value: Any) -> None:
+        table = pa.table({"alpha": [1, 3]})
+
+        with patch.object(mloda, "run_all", return_value=[table]) as run_all:
+            assert run_csv_feature(tmp_path, **{keyword: value}) == [1, 3]
+
+        assert run_all.call_args.kwargs[keyword] == value
 
 
 class TestFailingFeatureGroup:

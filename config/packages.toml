@@ -31,7 +31,7 @@ py_typed = true
 
 [packages.mloda-enterprise]
 description = "All enterprise plugins for mloda (License required: https://mloda.ai/enterprise)"
-dependencies = ["{core_dependency}"]
+dependencies = ["{core_dependency}", "mloda-community-extenders-shared>={version}"]
 path = "mloda/enterprise"
 published = true
 entry_point_bundle = true
@@ -80,7 +80,7 @@ path = "mloda/community/extenders/example"
 entry_point_groups = ["mloda.extenders"]
 
 [packages.mloda-community-extenders-shared]
-description = "Pickle-safety helper shared by mloda community extenders"
+description = "Pickle-safety and open-invocation helpers shared by mloda extenders"
 dependencies = ["{core_dependency}"]
 path = "mloda/community/extenders/shared"
 published = true
@@ -118,7 +118,7 @@ entry_point_groups = ["mloda.extenders"]
 
 [packages.mloda-enterprise-audit]
 description = "Tenant-scoped audit records with an identity presence gate for mloda pipelines"
-dependencies = ["{core_dependency}"]
+dependencies = ["{core_dependency}", "mloda-community-extenders-shared>={version}"]
 path = "mloda/enterprise/extenders/audit"
 optional_dependencies = { dev = ["mloda-testing", "pytest>=9.0.3", "cryptography>=42"] }
 entry_point_groups = ["mloda.extenders"]

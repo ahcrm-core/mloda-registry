@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import contextvars
 import logging
 import threading
 import time
@@ -15,6 +14,7 @@ from typing import Any
 
 from mloda.steward import Extender, ExtenderHook, HookContext, OutputSchema
 
+from mloda.community.extenders.shared.open_invocations import OpenInvocationStack
 from mloda.community.extenders.shared.pickle_safety import pickle_failure_reason
 from openlineage.client.client import OpenLineageClient
 from openlineage.client.event_v2 import InputDataset, Job, OutputDataset, Run, RunEvent, RunState
@@ -35,9 +35,7 @@ class _OpenCalculateInvocation:
     inputs: list[InputDataset] = field(default_factory=list)
 
 
-_open_invocations: contextvars.ContextVar[tuple[tuple[int, "_OpenCalculateInvocation"], ...]] = contextvars.ContextVar(
-    "openlineage_open_invocations", default=()
-)
+_open_invocations: OpenInvocationStack[_OpenCalculateInvocation] = OpenInvocationStack("openlineage_open_invocations")
 
 
 @dataclass
@@ -220,7 +218,7 @@ class OpenLineageExtender(Extender):
         return self._call_calculate_feature(context, func, *args, **kwargs)
 
     def _call_input_data_load(self, context: HookContext, func: Any, *args: Any, **kwargs: Any) -> Any:
-        invocation = self._find_open_invocation()
+        invocation = _open_invocations.find(self)
         if invocation is not None and context.data_access_identity is not None:
             already_present = any(
                 i.namespace == self.dataset_namespace and i.name == context.data_access_identity
@@ -241,14 +239,6 @@ class OpenLineageExtender(Extender):
         if invocation is None:
             logger.debug("OpenLineageExtender: INPUT_DATA_LOAD has no enclosing open calculate invocation to attach to")
         return func(*args, **kwargs)
-
-    def _find_open_invocation(self) -> _OpenCalculateInvocation | None:
-        """Return this instance's own last-opened invocation from the shared stack, else None."""
-        my_id = id(self)
-        for key, invocation in reversed(_open_invocations.get()):
-            if key == my_id:
-                return invocation
-        return None
 
     def _call_calculate_feature(self, context: HookContext, func: Any, *args: Any, **kwargs: Any) -> Any:
         run_facets: dict[str, Any] = {}
@@ -283,9 +273,9 @@ class OpenLineageExtender(Extender):
             )
         )
 
-        token = _open_invocations.set(_open_invocations.get() + ((id(self), invocation),))
         try:
-            result = func(*args, **kwargs)
+            with _open_invocations.open(self, invocation):
+                result = func(*args, **kwargs)
         except BaseException as exc:
             event_state = RunState.FAIL if isinstance(exc, Exception) else RunState.ABORT
             # Guarded: a transport error on the FAIL/ABORT path must not mask the wrapped function's exception.
@@ -311,8 +301,6 @@ class OpenLineageExtender(Extender):
             outcome = "failure" if event_state == RunState.FAIL else "abort"
             logger.warning("OpenLineageExtender observed %s %s: %s: %s", job.name, outcome, type(exc).__name__, exc)
             raise
-        finally:
-            _open_invocations.reset(token)
 
         # Guarded: a bug in this post-success block must never corrupt func's already-computed result.
         try:

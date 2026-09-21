@@ -9,7 +9,7 @@ import logging
 import os
 import pickle  # nosec
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
@@ -17,15 +17,22 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from mloda.steward import Extender, ExtenderHook, verified_context
+from mloda.steward import CompositeExtender, Extender, ExtenderHook, HookContext, verified_context
 from mloda.user import ParallelizationMode, PluginCollector, mloda
 from mloda_plugins.compute_framework.base_implementations.pyarrow.table import PyArrowTable
+from mloda_plugins.feature_group.input_data.read_file_feature import ReadFileFeature
 
 from mloda.enterprise.extenders.audit import AuditExtender, IdentityRequiredError, NdjsonAuditSink
+from mloda.enterprise.extenders.audit import audit_extender as audit_extender_module
 from mloda.testing.data_creator.pyarrow import PyArrowDataOpsTestDataCreator
 from mloda.testing.extenders.contract import ExtenderContractTestMixin
 from mloda.testing.extenders.hook_context import make_hook_context
-from mloda.testing.extenders.runners import CountingExtender, expected_value_int, run_value_int
+from mloda.testing.extenders.runners import (
+    CountingExtender,
+    expected_value_int,
+    run_csv_feature,
+    run_value_int,
+)
 
 _BOTH_POSTURES = pytest.mark.parametrize("fail_closed", [False, True])
 
@@ -65,6 +72,8 @@ _EXPECTED_RECORD_KEYS = {
     "duration_seconds",
     "status",
     "error_type",
+    "data_access_identity",
+    "data_access_format",
 }
 
 
@@ -89,6 +98,163 @@ class _CountingCall:
         return 42
 
 
+_BUCKET_KEY = "s3://bucket/key.parquet"
+
+# Stands in for the FeatureSet core passes after data_access.
+_FEATURES_PLACEHOLDER = object()
+
+_OUTER_CLASS = "my.module.OuterFeatureGroup"
+_INNER_CLASS = "my.module.InnerFeatureGroup"
+
+
+def _load_context(identity: str | None, data_format: str | None = None) -> HookContext:
+    """An INPUT_DATA_LOAD context without a tenant_id, so a load that got gated would be refused."""
+    return make_hook_context(
+        hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity=identity, data_access_format=data_format
+    )
+
+
+def _load(
+    extender: Callable[..., Any], identity: str | None, data_format: str | None = None, *, args: tuple[Any, ...] = ()
+) -> Any:
+    """Run one wrapped load, passing args to the wrapped call; call it from inside a calculate call."""
+    with _load_context(identity, data_format).activate():
+        return extender(lambda *_: "loaded", *args)
+
+
+def _calculate(extender: Callable[..., Any], body: Callable[[], Any], feature_group_class: str = _OUTER_CLASS) -> Any:
+    """Run body as one wrapped calculate call under a present tenant_id."""
+    with make_hook_context(feature_group_class=feature_group_class, tenant_id="tenant-1").activate():
+        return extender(body)
+
+
+def _record_for_loads(loads: list[tuple[str | None, str | None]], args: tuple[Any, ...] = ()) -> dict[str, Any]:
+    """The record of one calculate call that ran the given (identity, format) loads, each called with args."""
+    sink = InMemoryAuditSink()
+    extender = AuditExtender(sink=sink)
+
+    def body() -> None:
+        for identity, data_format in loads:
+            _load(extender, identity, data_format, args=args)
+
+    _calculate(extender, body)
+
+    assert len(sink.records) == 1
+    return sink.records[0]
+
+
+def _assert_logged_no_enclosing_calculate(caplog: pytest.LogCaptureFixture) -> None:
+    """Exactly one DEBUG message from the audit extender's logger says the load had no open calculate."""
+    matching = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG
+        and r.name == audit_extender_module.__name__
+        and "AuditExtender" in r.getMessage()
+        and "calculate" in r.getMessage().lower()
+        and ("enclosing" in r.getMessage().lower() or "open" in r.getMessage().lower())
+    ]
+    assert len(matching) == 1, [(r.name, r.levelno, r.getMessage()) for r in caplog.records]
+
+
+# (raw identity, sanitized identity, secret markers that must not survive anywhere in the record)
+_URI_SANITIZER_CASES = [
+    pytest.param(_BUCKET_KEY, _BUCKET_KEY, (), id="clean_s3_unchanged"),
+    pytest.param(
+        "https://user:pw@host/p/a?sig=SECRET#frag", "https://host/p/a", ("SECRET", "pw"), id="userinfo_query_fragment"
+    ),
+    pytest.param("postgresql://user:pw@db:5432/mydb", "postgresql://db:5432/mydb", ("pw",), id="userinfo_with_port"),
+    pytest.param(
+        "jdbc:postgresql://h/db?password=SECRET", "jdbc:postgresql://h/db", ("SECRET",), id="compound_scheme_query"
+    ),
+    pytest.param(
+        "https://b.com&token=SECRET",
+        "https://b.com",
+        ("SECRET", "token"),
+        id="core_greedy_strip_leak_ampersand_tail_in_authority",
+    ),
+    pytest.param("https://[::1]:8080/x?k=v", "https://[::1]:8080/x", ("k=v",), id="ipv6_host_with_port"),
+    pytest.param("file:///tmp/data.csv", "file:///tmp/data.csv", (), id="file_uri_empty_authority_unchanged"),
+    pytest.param("https://host?x=1", "https://host", ("x=1",), id="query_directly_after_host"),
+    pytest.param("https://host/p?", "https://host/p", (), id="empty_query"),
+    pytest.param("https://u:p@ss@host/db", "https://host/db", ("p@ss",), id="synthetic_at_sign_inside_userinfo"),
+    pytest.param(
+        "jdbc:hive2://h:10000/default;user=u;password=SECRET",
+        "jdbc:hive2://h:10000/default",
+        ("SECRET",),
+        id="jdbc_semicolon_params_cut_from_path",
+    ),
+    pytest.param(
+        "jdbc:sqlserver://h:1433;password=SECRET",
+        "jdbc:sqlserver://h:1433",
+        ("SECRET",),
+        id="jdbc_semicolon_params_cut_from_authority",
+    ),
+    pytest.param("my_scheme://host?tok=SECRET", "my_scheme://host", ("SECRET",), id="underscore_in_scheme"),
+    pytest.param(
+        "https://b.com/x&sig=SECRET",
+        "https://b.com/x",
+        ("SECRET", "sig"),
+        id="core_greedy_strip_leak_ampersand_tail_in_path",
+    ),
+    pytest.param(
+        "mongodb://h1:27017,h2:27017/db?replicaSet=rs",
+        "mongodb://h1:27017,h2:27017/db",
+        ("replicaSet",),
+        id="multi_host_authority_stays_intact",
+    ),
+    pytest.param("s3://münchen-bucket/key.parquet", "s3://münchen-bucket/key.parquet", (), id="non_ascii_host_kept"),
+    pytest.param(
+        "s3://bucket/t/dt=2026-09-20/part.parquet",
+        "s3://bucket/t/dt=2026-09-20/part.parquet",
+        (),
+        id="hive_style_equals_in_path_kept",
+    ),
+    pytest.param(
+        "postgresql://user:pa/ss@host/db", "postgresql://host/db", ("pa/ss",), id="synthetic_slash_in_password"
+    ),
+    pytest.param("postgresql://u:p&q@host/db", "postgresql://host/db", ("p&q",), id="synthetic_ampersand_in_password"),
+    pytest.param(
+        "https://host=SECRET/p/a", "https://host", ("SECRET",), id="equals_in_authority_cuts_it_and_drops_the_path"
+    ),
+    pytest.param(
+        "https://host SECRET/p/a", "https://host", ("SECRET",), id="whitespace_in_authority_cuts_it_and_drops_the_path"
+    ),
+]
+
+# (raw data_access, identity core put on the load context, sanitized raw, secret markers absent from the record)
+_RAW_FIRST_CASES = [
+    pytest.param(
+        "https://host/p?email=a@b.com/x&sig=SECRET",
+        "https://b.com/x&sig=SECRET",
+        "https://host/p",
+        ("SECRET", "a@b.com", "b.com"),
+        id="at_sign_in_query_value",
+    ),
+    pytest.param(
+        "https://host/dl?url=https://user@o.example/f&token=SECRET",
+        "https://o.example/f&token=SECRET",
+        "https://host/dl",
+        ("SECRET", "o.example"),
+        id="uri_in_query_value",
+    ),
+    pytest.param(
+        "postgresql://host/db?user=u&password=p@ss/word",
+        "postgresql://ss/word",
+        "postgresql://host/db",
+        ("p@ss", "ss/word"),
+        id="password_with_at_sign_and_slash_in_query",
+    ),
+    pytest.param("/data/dir?/file#1.csv", "/data/dir", "/data/dir?/file#1.csv", (), id="non_uri_str_recorded_as_given"),
+]
+
+_NON_URI_IDENTITIES = [
+    pytest.param("/data/dir?/file#1.csv", id="path_with_query_and_fragment_chars"),
+    pytest.param("{host, port}", id="core_dict_form"),
+    pytest.param("host=h user=u password=SECRET", id="keyword_dsn_documented_gap_passes_through"),
+]
+
+
 class TestAuditExtenderContract(ExtenderContractTestMixin):
     """AuditExtender satisfies the shared Extender contract."""
 
@@ -100,7 +266,7 @@ class TestAuditExtenderContract(ExtenderContractTestMixin):
 
     @classmethod
     def expected_hooks(cls) -> set[ExtenderHook] | None:
-        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+        return {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, ExtenderHook.INPUT_DATA_LOAD}
 
     @classmethod
     def has_backend_sink(cls) -> bool:
@@ -135,7 +301,11 @@ class TestAuditExtenderFailClosedContract(TestAuditExtenderContract):
 
     @classmethod
     def expected_hooks(cls) -> set[ExtenderHook] | None:
-        return {ExtenderHook.FEATURE_GROUP_MATCHED, ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+        return {
+            ExtenderHook.FEATURE_GROUP_MATCHED,
+            ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+            ExtenderHook.INPUT_DATA_LOAD,
+        }
 
     @classmethod
     def context_identity(cls) -> dict[str, str]:
@@ -173,9 +343,18 @@ class TestAuditExtenderConstruction:
     def test_fail_closed_with_defaults_is_accepted_wraps_the_matched_hook_and_sorts_outermost(self) -> None:
         extender = AuditExtender(sink=InMemoryAuditSink(), fail_closed=True)
 
-        assert extender.wraps() == {ExtenderHook.FEATURE_GROUP_MATCHED, ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE}
+        assert extender.wraps() == {
+            ExtenderHook.FEATURE_GROUP_MATCHED,
+            ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE,
+            ExtenderHook.INPUT_DATA_LOAD,
+        }
         assert extender.priority == 0
         assert AuditExtender(sink=InMemoryAuditSink()).priority == 100
+
+    def test_default_posture_wraps_the_calculate_and_input_data_load_hooks(self) -> None:
+        extender = AuditExtender(sink=InMemoryAuditSink())
+
+        assert extender.wraps() == {ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, ExtenderHook.INPUT_DATA_LOAD}
 
 
 class TestAuditExtenderRecord:
@@ -458,6 +637,282 @@ class TestAuditExtenderFailClosed:
         assert isinstance(excinfo.value.__context__, IdentityRequiredError)
 
 
+class TestAuditExtenderDataAccess:
+    """A load nested in a calculate call is recorded on that call's record, sanitized, never on a record of its own."""
+
+    def test_calculate_without_a_load_records_empty_lists(self) -> None:
+        record = _record_for_loads([])
+
+        assert record["data_access_identity"] == []
+        assert record["data_access_format"] == []
+
+    def test_refusal_record_carries_empty_data_access_lists(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, fail_closed=True)
+
+        with make_hook_context().activate():
+            with pytest.raises(IdentityRequiredError):
+                extender(_CountingCall())
+
+        assert sink.records[0]["data_access_identity"] == []
+        assert sink.records[0]["data_access_format"] == []
+
+    def test_nested_load_lands_on_the_enclosing_record_and_writes_no_record_of_its_own(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+        results: list[Any] = []
+
+        def body() -> None:
+            results.append(_load(extender, _BUCKET_KEY, "ParquetReader"))
+
+        _calculate(extender, body)
+
+        assert results == ["loaded"]
+        assert len(sink.records) == 1
+        record = sink.records[0]
+        assert record["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name
+        assert record["record_version"] == 1
+        assert record["data_access_identity"] == [_BUCKET_KEY]
+        assert record["data_access_format"] == ["ParquetReader"]
+
+    def test_format_none_stays_none_inside_the_list(self) -> None:
+        record = _record_for_loads([(_BUCKET_KEY, None)])
+
+        assert record["data_access_identity"] == [_BUCKET_KEY]
+        assert record["data_access_format"] == [None]
+
+    def test_load_without_an_identity_is_skipped(self) -> None:
+        record = _record_for_loads([(None, "CsvReader")])
+
+        assert record["data_access_identity"] == []
+        assert record["data_access_format"] == []
+
+    def test_failing_load_appears_on_the_error_record_and_the_exception_propagates(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+        calls = 0
+
+        def failing_load() -> None:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("load boom")
+
+        def body() -> None:
+            with _load_context(_BUCKET_KEY, "ParquetReader").activate():
+                extender(failing_load)
+
+        with pytest.raises(RuntimeError, match="load boom"):
+            _calculate(extender, body)
+
+        assert calls == 1
+        assert len(sink.records) == 1
+        record = sink.records[0]
+        assert record["status"] == "error"
+        assert record["error_type"] == "builtins.RuntimeError"
+        assert record["data_access_identity"] == [_BUCKET_KEY]
+        assert record["data_access_format"] == ["ParquetReader"]
+
+    def test_failing_load_swallowed_by_the_calculate_body_is_still_recorded(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        def failing_load() -> None:
+            raise RuntimeError("load boom")
+
+        def body() -> None:
+            with _load_context(_BUCKET_KEY).activate():
+                with pytest.raises(RuntimeError, match="load boom"):
+                    extender(failing_load)
+
+        _calculate(extender, body)
+
+        assert len(sink.records) == 1
+        assert sink.records[0]["status"] == "success"
+        assert sink.records[0]["data_access_identity"] == [_BUCKET_KEY]
+
+    def test_repeated_identical_loads_are_deduplicated(self) -> None:
+        record = _record_for_loads([(_BUCKET_KEY, "ParquetReader")] * 3)
+
+        assert record["data_access_identity"] == [_BUCKET_KEY]
+        assert record["data_access_format"] == ["ParquetReader"]
+
+    def test_distinct_loads_keep_first_seen_order_and_stay_index_aligned(self) -> None:
+        other = "s3://bucket/other.csv"
+
+        record = _record_for_loads(
+            [(_BUCKET_KEY, "ParquetReader"), (other, "CsvReader"), (_BUCKET_KEY, "ParquetReader")]
+        )
+
+        assert record["data_access_identity"] == [_BUCKET_KEY, other]
+        assert record["data_access_format"] == ["ParquetReader", "CsvReader"]
+
+    def test_same_identity_under_two_formats_gives_two_entries(self) -> None:
+        record = _record_for_loads([(_BUCKET_KEY, "CsvReader"), (_BUCKET_KEY, "ParquetReader")])
+
+        assert record["data_access_identity"] == [_BUCKET_KEY, _BUCKET_KEY]
+        assert record["data_access_format"] == ["CsvReader", "ParquetReader"]
+
+    def test_loads_that_sanitize_to_the_same_identity_are_deduplicated(self) -> None:
+        record = _record_for_loads(
+            [("https://a:1@host/x?sig=one", "CsvReader"), ("https://b:2@host/x?sig=two", "CsvReader")]
+        )
+
+        assert record["data_access_identity"] == ["https://host/x"]
+        assert record["data_access_format"] == ["CsvReader"]
+
+    def test_nested_calculate_attributes_each_load_to_its_own_level(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        def inner_body() -> None:
+            _load(extender, "s3://bucket/inner.parquet")
+
+        def outer_body() -> None:
+            _calculate(extender, inner_body, feature_group_class=_INNER_CLASS)
+            _load(extender, "s3://bucket/outer.parquet")
+
+        _calculate(extender, outer_body, feature_group_class=_OUTER_CLASS)
+
+        by_class = {record["feature_group_class"]: record for record in sink.records}
+        assert len(sink.records) == 2
+        assert by_class[_INNER_CLASS]["data_access_identity"] == ["s3://bucket/inner.parquet"]
+        assert by_class[_OUTER_CLASS]["data_access_identity"] == ["s3://bucket/outer.parquet"]
+
+    def test_load_after_a_raising_inner_calculate_attaches_to_the_outer_call(self) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        def inner_body() -> None:
+            _load(extender, "s3://bucket/inner.parquet")
+            raise RuntimeError("inner boom")
+
+        def outer_body() -> None:
+            with pytest.raises(RuntimeError, match="inner boom"):
+                _calculate(extender, inner_body, feature_group_class=_INNER_CLASS)
+            _load(extender, "s3://bucket/outer.parquet")
+
+        _calculate(extender, outer_body, feature_group_class=_OUTER_CLASS)
+
+        by_class = {record["feature_group_class"]: record for record in sink.records}
+        assert len(sink.records) == 2
+        assert by_class[_INNER_CLASS]["status"] == "error"
+        assert by_class[_INNER_CLASS]["data_access_identity"] == ["s3://bucket/inner.parquet"]
+        assert by_class[_OUTER_CLASS]["data_access_identity"] == ["s3://bucket/outer.parquet"]
+
+    def test_stack_is_restored_after_a_calculate_that_raises(self, caplog: pytest.LogCaptureFixture) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink)
+
+        def failing_body() -> None:
+            raise RuntimeError("calculate boom")
+
+        with pytest.raises(RuntimeError, match="calculate boom"):
+            _calculate(extender, failing_body)
+        with caplog.at_level(logging.DEBUG):
+            assert _load(extender, _BUCKET_KEY) == "loaded"
+
+        assert len(sink.records) == 1
+        assert sink.records[0]["data_access_identity"] == []
+        _assert_logged_no_enclosing_calculate(caplog)
+
+    @_BOTH_POSTURES
+    def test_load_without_an_enclosing_calculate_passes_through_writes_nothing_and_logs_debug(
+        self, fail_closed: bool, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, fail_closed=fail_closed)
+        call = _CountingCall()
+
+        with caplog.at_level(logging.DEBUG):
+            with _load_context(_BUCKET_KEY, "ParquetReader").activate():
+                result = extender(call)
+
+        assert result == 42
+        assert call.calls == 1
+        assert sink.records == []
+        _assert_logged_no_enclosing_calculate(caplog)
+
+    @_BOTH_POSTURES
+    def test_nested_load_passes_through_untouched_even_without_a_tenant_id_on_the_load(self, fail_closed: bool) -> None:
+        sink = InMemoryAuditSink()
+        extender = AuditExtender(sink=sink, fail_closed=fail_closed)
+        call = _CountingCall()
+        results: list[int] = []
+
+        def body() -> None:
+            with _load_context(_BUCKET_KEY).activate():
+                results.append(extender(call))
+
+        _calculate(extender, body)
+
+        assert results == [42]
+        assert call.calls == 1
+        assert len(sink.records) == 1
+        record = sink.records[0]
+        assert record["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name
+        assert record["decision"] == "allow"
+        assert record["data_access_identity"] == [_BUCKET_KEY]
+
+    def test_composite_of_two_extenders_attributes_each_load_to_the_extender_that_saw_it(self) -> None:
+        sink_a = InMemoryAuditSink()
+        sink_b = InMemoryAuditSink()
+        extender_a = AuditExtender(sink=sink_a)
+        extender_b = AuditExtender(sink=sink_b)
+        composite = CompositeExtender([extender_a, extender_b])
+
+        def body() -> None:
+            _load(composite, "s3://bucket/both.parquet")
+            _load(extender_a, "s3://bucket/only-a.parquet")
+
+        _calculate(composite, body)
+
+        assert [r["data_access_identity"] for r in sink_a.records] == [
+            ["s3://bucket/both.parquet", "s3://bucket/only-a.parquet"]
+        ]
+        assert [r["data_access_identity"] for r in sink_b.records] == [["s3://bucket/both.parquet"]]
+
+    @pytest.mark.parametrize(("raw", "expected", "secrets"), _URI_SANITIZER_CASES)
+    def test_uri_identity_is_sanitized_before_it_is_stored(
+        self, raw: str, expected: str, secrets: tuple[str, ...]
+    ) -> None:
+        record = _record_for_loads([(raw, None)])
+
+        assert record["data_access_identity"] == [expected]
+        for secret in secrets:
+            assert secret not in json.dumps(record)
+
+    @pytest.mark.parametrize("raw", _NON_URI_IDENTITIES)
+    def test_non_uri_identity_passes_through_unchanged(self, raw: str) -> None:
+        record = _record_for_loads([(raw, None)])
+
+        assert record["data_access_identity"] == [raw]
+
+    @pytest.mark.parametrize(("raw", "context_identity", "expected", "secrets"), _RAW_FIRST_CASES)
+    def test_a_str_first_argument_is_sanitized_instead_of_the_lossy_context_identity(
+        self, raw: str, context_identity: str, expected: str, secrets: tuple[str, ...]
+    ) -> None:
+        record = _record_for_loads([(context_identity, "CsvReader")], args=(raw, _FEATURES_PLACEHOLDER))
+
+        assert record["data_access_identity"] == [expected]
+        assert record["data_access_format"] == ["CsvReader"]
+        for secret in secrets:
+            assert secret not in json.dumps(record)
+
+    def test_a_non_str_first_argument_falls_back_to_the_context_identity(self) -> None:
+        connection_params = {"host": "h", "port": 5432, "api_key": "SECRET"}
+
+        record = _record_for_loads([("{host, port}", None)], args=(connection_params, _FEATURES_PLACEHOLDER))
+
+        assert record["data_access_identity"] == ["{host, port}"]
+        assert "SECRET" not in json.dumps(record)
+
+    def test_a_load_without_a_context_identity_is_skipped_even_with_a_uri_first_argument(self) -> None:
+        record = _record_for_loads([(None, "CsvReader")], args=("https://host/p?sig=SECRET", _FEATURES_PLACEHOLDER))
+
+        assert record["data_access_identity"] == []
+        assert record["data_access_format"] == []
+
+
 class TestNdjsonAuditSink:
     """NdjsonAuditSink appends one JSON line per record, surviving a pickle round trip."""
 
@@ -564,6 +1019,29 @@ class TestAuditExtenderRunAll:
             assert record["status"] == "success"
             assert record["run_id"] is not None
             assert record["hook"] == ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE.name
+
+    @pytest.mark.parametrize(
+        "mode", [ParallelizationMode.SYNC, ParallelizationMode.THREADING, ParallelizationMode.MULTIPROCESSING]
+    )
+    def test_run_all_csv_read_records_the_load_identity_and_format(
+        self, mode: ParallelizationMode, tmp_path: Path, request: pytest.FixtureRequest
+    ) -> None:
+        audit_path = tmp_path / "audit.ndjson"
+        extender = AuditExtender(sink=NdjsonAuditSink(audit_path))
+        # Only MULTIPROCESSING needs the flight_server fixture.
+        flight_server = (
+            request.getfixturevalue("flight_server") if mode == ParallelizationMode.MULTIPROCESSING else None
+        )
+
+        with verified_context(tenant_id="tenant-42"):
+            run_csv_feature(tmp_path, extender, parallelization_modes={mode}, flight_server=flight_server)
+
+        read_class = f"{ReadFileFeature.__module__}.{ReadFileFeature.__qualname__}"
+        sink_records = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+        records = [record for record in sink_records if record["feature_group_class"] == read_class]
+        assert len(records) == 1
+        assert records[0]["data_access_identity"] == [str(tmp_path / "data.csv")]
+        assert records[0]["data_access_format"] == ["CsvReader"]
 
     def test_run_all_without_verified_context_denies_but_still_runs(self) -> None:
         sink = InMemoryAuditSink()

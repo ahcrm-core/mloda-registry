@@ -821,7 +821,7 @@ def test_bundle_declares_every_nested_leaf_external_runtime_dependency() -> None
     import cleanly without the dependency; see mloda-community-openlineage). This guards the invariant
     for the FUTURE: nothing else stops a new bundled leaf with an external runtime dependency from
     being added without covering it in the bundle again (as mloda-community-otel's opentelemetry-api
-    once was)."""
+    once was). Likewise for a sibling outside the bundle: the bundle must list it too."""
     packages = _packages()
     core_placeholder = "{core_dependency}"
 
@@ -834,6 +834,7 @@ def test_bundle_declares_every_nested_leaf_external_runtime_dependency() -> None
             bundle_dep_sources.extend(extra_deps)
 
         bundle_floors: dict[str, str | None] = {}
+        bundle_siblings: set[str] = set()
         for dep in bundle_dep_sources:
             if dep.strip() == core_placeholder:
                 continue
@@ -841,6 +842,8 @@ def test_bundle_declares_every_nested_leaf_external_runtime_dependency() -> None
             if parsed is None:
                 continue
             name, floor = parsed
+            if name in packages:
+                bundle_siblings.add(name)
             if name in packages or name == "mloda":
                 continue  # internal-registry dependency, or the core dependency's own expansion
             if name not in bundle_floors:
@@ -850,7 +853,8 @@ def test_bundle_declares_every_nested_leaf_external_runtime_dependency() -> None
                 if existing is None or version_tuple(floor) > version_tuple(existing):
                     bundle_floors[name] = floor
 
-        for nested_name in _nested_under(bundle_name, packages):
+        nested_names = _nested_under(bundle_name, packages)
+        for nested_name in nested_names:
             for dep in packages[nested_name].get("dependencies", []):
                 if dep.strip() == core_placeholder:
                     continue
@@ -858,6 +862,14 @@ def test_bundle_declares_every_nested_leaf_external_runtime_dependency() -> None
                 if parsed is None:
                     continue
                 name, floor = parsed
+                if name in packages and name != bundle_name and name not in nested_names:
+                    # A sibling outside the bundle: the "{version}" floor reads the same on both sides.
+                    assert name in bundle_siblings, (
+                        f"{nested_name} declares sibling dependency {dep!r}, outside {bundle_name}, but "
+                        f"{bundle_name} does not list {name!r} in its own 'dependencies' or in one of its extras; "
+                        f"{bundle_name} ships {nested_name}'s code without its pyproject.toml, so nothing else "
+                        f"installs {name!r} for it."
+                    )
                 if name in packages or name == "mloda":
                     continue  # internal-registry dependency, or the core dependency's own expansion
 
