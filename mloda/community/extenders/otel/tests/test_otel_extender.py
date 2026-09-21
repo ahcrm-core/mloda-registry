@@ -373,8 +373,26 @@ class TestOtelExtenderNoSdkProviderWarning:
         assert _marker_records(caplog) == []
 
 
-class TestOtelExtenderInertContentCapture:
-    def test_inert_extender_never_calls_mask(self) -> None:
+class TestOtelExtenderNonRecordingContentCapture:
+    @pytest.mark.parametrize(
+        ("use_sdk_defaults", "inject_provider", "carrier"),
+        [
+            (False, False, None),
+            (True, False, None),
+            # A remote parent with the sampled flag unset (-00): the default ParentBased sampler drops the span.
+            (False, True, {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00"}),
+        ],
+        ids=["inert", "ambient_api_default", "unsampled_parent"],
+    )
+    def test_non_recording_span_never_calls_mask(
+        self,
+        ambient_provider: _AmbientProvider,
+        otel_capture: tuple[TracerProvider, InMemorySpanExporter],
+        use_sdk_defaults: bool,
+        inject_provider: bool,
+        carrier: dict[str, str] | None,
+    ) -> None:
+        provider, exporter = otel_capture
         calls = 0
 
         def mask(_value: Any) -> Any:
@@ -382,14 +400,20 @@ class TestOtelExtenderInertContentCapture:
             calls += 1
             return _value
 
-        otel = OtelExtender(capture_content=True, mask=mask)
-        context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE)
+        otel = OtelExtender(
+            capture_content=True,
+            mask=mask,
+            tracer_provider=provider if inject_provider else None,
+            use_sdk_defaults=use_sdk_defaults,
+        )
+        context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, carrier=carrier)
 
         with context.activate():
             result = otel(lambda: [1, 2, 3])
 
         assert result == [1, 2, 3]
         assert calls == 0
+        assert exporter.get_finished_spans() == ()
 
 
 class TestOtelExtenderPickling:
