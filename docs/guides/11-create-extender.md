@@ -262,6 +262,7 @@ The mixin pins:
 - no event ever leaks the exception message
 - the parent facet ties the run to the ambient `run_id`
 - a nested `INPUT_DATA_LOAD` call becomes an input, on both COMPLETE and FAIL, when the extender wraps that hook; the input is attributed before the load runs, so a failing load still appears on the FAIL event, and inputs mean attempted reads
+- the calculate context's declared `input_features` become inputs too, on both COMPLETE and FAIL, so a host must report them
 - a START emit failure under warning-only mode never prevents the wrapped call from running
 - `run_all` events share one parent run id
 

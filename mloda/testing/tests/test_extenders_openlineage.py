@@ -48,7 +48,8 @@ def _build_run_event() -> RunEvent:
 
 
 class _ProbeOpenLineageExtender(Extender):
-    """Minimal OpenLineage probe: START/COMPLETE|FAIL|ABORT per calculate, correlating nested input loads."""
+    """Minimal OpenLineage probe: START/COMPLETE|FAIL|ABORT per calculate, correlating nested input loads and
+    input features."""
 
     def __init__(
         self,
@@ -122,7 +123,9 @@ class _ProbeOpenLineageExtender(Extender):
         )
 
         previous_inputs = self._open_inputs
-        self._open_inputs = []
+        self._open_inputs = [
+            InputDataset(namespace="probe", name=name) for name in sorted(context.input_features or ())
+        ]
         current_inputs: list[InputDataset] = []
         try:
             result = func(*args, **kwargs)
