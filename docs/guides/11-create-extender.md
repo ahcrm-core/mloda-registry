@@ -146,6 +146,38 @@ sink = TeeAuditSink(NdjsonAuditSink("audit.ndjson"), OtelLogAuditSink())
 extender = AuditExtender(sink, fail_closed=True)
 ```
 
+## Lineage facets
+
+`LineageFacetsExtender` (`mloda-enterprise-lineage`) is used instead of `OpenLineageExtender`, not next to it. It needs the extra `mloda-enterprise[openlineage]`; without it the extender is not registered. Beyond the community events it adds:
+
+- `columnLineage` on each output dataset: DIRECT edges from the step's declared input features; root steps have none.
+- `masking` on those edges, only when declared (see below).
+- `dataQualityAssertions` on validation runs: one assertion named after the validator, `success` true or false.
+- a `mloda` run facet: `featureGroupVersion`, `pluginVersion`, `computeFramework`, `maskedFeatures` and `structureHash`.
+
+Masking is declared, never inferred: set the class attribute `masking = True` on the feature group, or the option `masking=True` in the feature's own `context`. It must be the boolean `True`; a `group` key, the string `"true"` and a context key forwarded from another step do not count. It is unrelated to core's `mask`.
+
+Column-lineage edges are step-level declared inputs. A step with several outputs cannot say which input feeds which, so every output lists every input (an over-approximation) and the transformation `description` reads `step-level declared inputs`.
+
+Validation is reported only for a feature group that overrides `validate_input_features` or `validate_output_features`. Each overridden validator is its own run per step, a sibling of the calculate run and both under the root run (job `<feature group>.<method>`, START then COMPLETE, FAIL or ABORT), so it adds one extra run and two events per step. The terminal event carries one input dataset per validated feature. Validate-input is skipped when the step has no data yet (root steps); when data exists it runs and the validated datasets fall back to the feature names if no inputs are declared. Core's own `EmptyResultError` and `DataTypeValidator` failures happen outside the hook, so they produce no assertion.
+
+A failing validator is re-raised and marks every validated dataset `success=false`, because the failing one is unknown. Its message can reach the WARNING log, as a calculate failure message already does, but never an event.
+
+Validation runs carry the parent facet only, not the `mloda` facet. Tie one to a calculate run through the job name and the run id.
+
+Validate-output assertions ride on input datasets of the `<feature group>.validate_output_features` job, the only spec-legal home for `dataQualityAssertions`.
+
+`structureHash` is the sha256 of the feature group class, versions, compute framework, feature names, declared inputs and masked features. It holds no run id or time, so it is stable across runs. It also changes with the feature group source and the mloda version, because both are part of `feature_group_version`.
+
+Option-declared masking has two limits:
+
+- When an ancestor feature propagates the `masking` key through `propagate_context_keys`, a step that also declares it counts as inherited and reports no masking.
+- When `input_features()` returns `Feature(name, options=options)`, sharing the consumer's own Options object, the upstream step reports masking.
+
+Declare `masking = True` on the feature group class for a per-feature-group guarantee.
+
+The `mloda` facet's schema URL points at its module in this repository; it is not a hosted JSON schema.
+
 ## Testing
 
 `mloda-testing` ships three test mixins plus helpers (`make_hook_context`, `run_value_int`, `failing_feature_group`) so every extender's test suite exercises the same shared behavior:
@@ -248,7 +280,7 @@ Helpers: `make_span_capture`, `make_picklable_span_capture`, `single_span`, `sin
 
 ### OpenLineageExtenderTestMixin
 
-Install `mloda-testing[openlineage]`. Host provides `extender_class` and `make_openlineage_extender(client, *, raise_on_error=None)`. It supplies `make_extender`, `own_failure`, and the sink-resolution hooks (`has_backend_sink`, `ambient_sink_environment`, `sink_resolution_spy`, `ambient_sink_captured`), so a host needs no extra code for the sink-resolution tests. It also sets `supports_pickled_sink_capture()` to `True` and supplies `injected_sink_capture`, exercising `OpenLineageExtender`'s picklable-injected-client preservation.
+Install `mloda-testing[openlineage]`. Host provides `extender_class` and `make_openlineage_extender(client, *, raise_on_error=None)`. It supplies `make_extender`, `own_failure`, and the sink-resolution hooks (`has_backend_sink`, `ambient_sink_environment`, `sink_resolution_spy`, `ambient_sink_captured`), so a host needs no extra code for the sink-resolution tests. It also sets `supports_pickled_sink_capture()` to `True` and supplies `injected_sink_capture`, exercising `OpenLineageExtender`'s picklable-injected-client preservation. Optional: `calculate_run_events(events)` (identity by default) returns only the events of the calculate runs; override it in a host that also emits other runs, such as nested validation runs, so the `run_all` tests that count COMPLETE events or inputs ignore them.
 
 ```python
 from openlineage.client.client import OpenLineageClient
@@ -294,5 +326,6 @@ The mixin pins:
 | [otel_extender.py](https://github.com/mloda-ai/mloda-registry/blob/main/mloda/community/extenders/otel/otel_extender.py) | OpenTelemetry spans, metadata-only by default; inert until a `tracer_provider` is injected or `use_sdk_defaults=True` with an SDK tracer provider configured (`mloda-community-otel`) |
 | [openlineage_extender.py](https://github.com/mloda-ai/mloda-registry/blob/main/mloda/community/extenders/openlineage/openlineage_extender.py) | OpenLineage RunEvents with schema, data-source and parent-run facets; inert until a `client` is injected or `use_sdk_defaults=True` (`mloda-community-openlineage`) |
 | [audit_extender.py](https://github.com/mloda-ai/mloda-registry/blob/main/mloda/enterprise/extenders/audit/audit_extender.py) | Tenant-scoped audit record per calculation with an identity presence gate (`fail_closed=True` refuses an unidentified run before any feature is calculated) that also lists the identity and format of each distinct data load the call attempted (URI query, fragment, parameters and user information stripped, best effort; other identities recorded as given, so not credential-free); a sink failure after a successful calculation fails the run by default; every record carries a `policy_version`; `TeeAuditSink` writes a record to several sinks and `OtelLogAuditSink` (extra `mloda-enterprise[otel]`) emits it as an OpenTelemetry log record; `seal_ndjson_runs` seals a finished run into a signed, hash-chained manifest that `verify_ndjson_log` checks, `rotate_manifest_key` records a key change, and `quarantine_damaged_lines` is the repair path for a torn log; `Ed25519Signer` (extra `mloda-enterprise[ed25519]`) makes seals non-repudiable and verifiable with the public key alone, and the unchanged `ManifestSigner` protocol lets a KMS-backed signer plug in later (none ships yet) (`mloda-enterprise-audit`, license required) |
+| [lineage_extender.py](https://github.com/mloda-ai/mloda-registry/blob/main/mloda/enterprise/extenders/lineage/lineage_extender.py) | Used instead of `OpenLineageExtender`: adds column lineage, declared masking, validator-outcome assertions and a `mloda` run facet with a structure hash (`mloda-enterprise-lineage`, extra `mloda-enterprise[openlineage]`, license required) |
 | [contract.py](https://github.com/mloda-ai/mloda-registry/blob/main/mloda/testing/extenders/contract.py) | Extender contract test mixin (mloda-testing) |
 | [test_composite_extender.py](https://github.com/mloda-ai/mloda/blob/main/tests/test_plugins/extender/test_composite_extender.py) | Chaining tests |
