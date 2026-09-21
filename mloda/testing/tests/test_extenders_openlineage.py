@@ -116,6 +116,15 @@ class TestOpenLineageExtenderTestMixinShape:
     def test_raise_on_error_default_is_false(self) -> None:
         assert OpenLineageExtenderTestMixin.raise_on_error_default() is False
 
+    def test_ambient_sink_captured_reads_events_from_the_spy_transports(self) -> None:
+        client, transport = make_recording_client()
+        event = _build_run_event()
+        client.emit(event)
+
+        mixin = OpenLineageExtenderTestMixin()
+        assert mixin.ambient_sink_captured([transport]) == [event]
+        assert mixin.ambient_sink_captured([RecordingTransport()]) == []
+
 
 class _DirectTransportProbeOpenLineageExtender(Extender):
     """Emits straight to the RecordingTransport, bypassing OpenLineageClient.emit entirely."""

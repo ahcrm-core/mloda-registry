@@ -112,6 +112,12 @@ class ExtenderContractTestMixin:
     def sink_resolution_spy(self) -> AbstractContextManager[list[Any]]:
         raise NotImplementedError
 
+    def ambient_sink_captured(self, spy: list[Any]) -> list[Any] | None:
+        """What the ambient sink(s) that sink_resolution_spy() handed out captured, read after the
+        extender call. The base default returns None, the documented opt-out for a host that cannot
+        expose a probe (the emission assertion is then skipped)."""
+        return None
+
     def make_extender_with_sink_probe(self) -> tuple[Extender, Callable[[], Any]]:
         """Return an extender wired to a fresh, per-instance in-memory sink, plus a zero-arg
         callable returning whatever that exact sink instance captured. Must be per-instance state
@@ -402,6 +408,9 @@ class ExtenderContractTestMixin:
             with self.contract_context().activate():
                 extender(lambda: None)
             assert spy != []
+            captured = self.ambient_sink_captured(spy)
+            if captured is not None:
+                assert captured != [], "ambient sink was resolved but the extender never emitted into it"
 
     def test_contract_pickled_copy_with_sdk_defaults_resolves_ambient_sink(self) -> None:
         if not self.has_backend_sink():

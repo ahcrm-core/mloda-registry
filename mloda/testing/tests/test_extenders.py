@@ -553,6 +553,9 @@ class TestExtenderContractTestMixinShape:
         with ExtenderContractTestMixin().pickled_copy_environment():
             pass
 
+    def test_ambient_sink_captured_defaults_to_none_opt_out(self) -> None:
+        assert ExtenderContractTestMixin().ambient_sink_captured([]) is None
+
     @pytest.mark.parametrize(
         "name",
         [

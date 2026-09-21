@@ -149,6 +149,25 @@ class TestOtelExtenderTestMixinShape:
     def test_expected_span_names_defaults_to_none(self) -> None:
         assert OtelExtenderTestMixin.expected_span_names() is None
 
+    def test_ambient_sink_captured_reads_finished_spans_from_the_spy_exporters(self) -> None:
+        provider, exporter = make_span_capture()
+        with provider.get_tracer("test-extenders-otel").start_as_current_span("probe-span"):
+            pass
+
+        mixin = OtelExtenderTestMixin()
+        captured = mixin.ambient_sink_captured([exporter])
+        assert captured is not None
+        assert [span.name for span in captured] == ["probe-span"]
+        assert mixin.ambient_sink_captured([]) == []
+
+    def test_sdk_defaults_contract_fails_when_the_ambient_sink_captured_nothing(self) -> None:
+        class _Host(TestProbeOtelExtenderContract):
+            def ambient_sink_captured(self, spy: list[Any]) -> list[Any] | None:
+                return []
+
+        with pytest.raises(AssertionError):
+            _Host().test_contract_sdk_defaults_resolves_sink()
+
 
 class _CachedTracerProbeOtelExtender(Extender):
     """Minimal OTel probe that resolves its tracer once in __init__ and never calls get_tracer again."""
