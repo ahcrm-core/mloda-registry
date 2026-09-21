@@ -120,7 +120,8 @@ A bundled plugin whose runtime dependency is heavy sits behind a bundle extra in
 hard dependency (today `mloda-community[otel]` and `mloda-community[openlineage]`, or both
 together via `mloda-community[all]`; also `mloda-enterprise[ed25519]`, though its plugin still
 loads without it), and its manifest must import cleanly without that dependency installed so
-entry-point loading of the rest of the bundle stays intact.
+entry-point loading of the rest of the bundle stays intact. The config steps are in
+[Add an optional runtime dependency to a bundle-only plugin](#add-an-optional-runtime-dependency-to-a-bundle-only-plugin).
 
 Moving a dependency behind an extra changes existing installs: when the dependency is missing,
 PluginLoader skips the entry point with a WARNING, and discovery never registers the extender.
@@ -241,8 +242,28 @@ member's `dev` extra (`--all-packages`), so root `pyproject.toml` never repeats
 the entry; but it installs the lock with `--frozen`, so a dependency missing
 from `uv.lock` is not installed.
 
+### Add an optional runtime dependency to a bundle-only plugin
+
+For a plugin that ships only inside `mloda-community` or `mloda-enterprise` and loads without the
+dependency (today `cryptography` behind `mloda-enterprise[ed25519]`, used by `mloda-enterprise-audit`):
+
+1. Add the extra to the bundle's `optional_dependencies` in `config/packages.toml`. For
+   `mloda-community`, also add it to the `all` extra.
+2. Add the same specifier to the leaf's `optional_dependencies.dev`, repeating the default `dev`
+   entries (a package's `dev` replaces them). Not its `dependencies`: a bundle install never reads them.
+3. Regenerate, run `uv lock` and commit `uv.lock`, as in
+   [Add a test-only dependency](#add-a-test-only-dependency).
+4. If a test imports the dependency, add its import name to `REQUIRED_TEST_DEPENDENCIES` in
+   `tests/test_end2end/test_dev_dependencies.py`.
+5. Add the install row to the README and to the install table under
+   [Individual packages](#individual-packages).
+
+Keep the floor in the bundle extra and in the leaf `dev` entry equal. Nothing enforces that pair:
+`test_mloda_community_declares_extra_matching_pin_source` only compares a bundle extra with a
+leaf's `dependencies`.
+
 ### Add a variant to an existing plugin
 
-Same as above, plus add the variant to the parent's `optional_dependencies.all`.
+Same as [Add a new package](#add-a-new-package), plus add the variant to the parent's `optional_dependencies.all`.
 If that extra is `["{published_children}"]`, do not edit it: set `published = true`
 on the variant instead, and the placeholder picks it up.
