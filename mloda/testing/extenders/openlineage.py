@@ -507,6 +507,29 @@ class OpenLineageExtenderTestMixin(ExtenderContractTestMixin):
         assert input_dataset.name == "s3://bucket/key.parquet"
         assert len(transport.events) == 2
 
+    def test_openlineage_input_data_load_query_string_never_reaches_events(self) -> None:
+        client, transport = make_recording_client()
+        extender = self.make_openlineage_extender(client)
+        if ExtenderHook.INPUT_DATA_LOAD not in extender.wraps():
+            pytest.skip("extender does not wrap INPUT_DATA_LOAD")
+        marker = "SENSITIVE_QUERY_VALUE_xyz123"
+        identity = f"s3://bucket/key.parquet?X-Amz-Signature={marker}"
+
+        inner_context = make_hook_context(hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity=identity)
+
+        def outer_func() -> None:
+            with inner_context.activate():
+                # Core passes the raw data access as arg 0; the shipped extender prefers it over the context value.
+                extender(lambda *_: "loaded-data", identity)
+
+        with make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE).activate():
+            extender(outer_func)
+
+        input_names = [dataset.name for event in transport.events for dataset in event.inputs or []]
+        assert any("key.parquet" in name for name in input_names), "the data load was not attributed as an input"
+        for event in transport.events:
+            assert marker not in Serde.to_json(event), "URI query string reached an event"
+
     def test_openlineage_fail_event_carries_nested_inputs(self) -> None:
         client, transport = make_recording_client()
         extender = self.make_openlineage_extender(client)
