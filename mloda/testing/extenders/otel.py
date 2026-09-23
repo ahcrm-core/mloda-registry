@@ -389,6 +389,78 @@ class OtelExtenderTestMixin(ExtenderContractTestMixin):
         assert span.context is not None
         assert span.context.trace_id == carrier_trace_id
 
+    def test_otel_input_data_load_query_string_never_reaches_span_attributes(self) -> None:
+        provider, exporter = make_span_capture()
+        extender = self.make_otel_extender(provider)
+        if ExtenderHook.INPUT_DATA_LOAD not in extender.wraps():
+            pytest.skip("extender does not wrap INPUT_DATA_LOAD")
+        marker = "SENSITIVE_QUERY_VALUE_xyz123"
+        identity = f"s3://bucket/key.parquet?X-Amz-Signature={marker}"
+
+        inner_context = make_hook_context(hook=ExtenderHook.INPUT_DATA_LOAD, data_access_identity=identity)
+
+        def outer_func() -> None:
+            with inner_context.activate():
+                # Core passes the raw data access as arg 0; the shipped extender prefers it over the context value.
+                extender(lambda *_: "loaded-data", identity)
+
+        with make_hook_context(hook=self.context_hook()).activate():
+            extender(outer_func)
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 2, spans  # the outer call's span plus the nested load span
+        for span in spans:
+            assert span.attributes is not None
+            for value in span.attributes.values():
+                assert marker not in str(value), span.attributes
+
+    @pytest.mark.parametrize("parenting", ["run_id", "carrier"])
+    def test_otel_load_nested_in_calculate_is_child_of_the_calculate_span(self, parenting: str) -> None:
+        provider, exporter = make_span_capture()
+        extender = self.make_otel_extender(provider)
+        wraps = extender.wraps()
+        if ExtenderHook.INPUT_DATA_LOAD not in wraps:
+            pytest.skip("extender does not wrap INPUT_DATA_LOAD")
+        if ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE not in wraps:
+            pytest.skip("extender does not wrap FEATURE_GROUP_CALCULATE_FEATURE")
+
+        # Both contexts share the same correlation (run_id or carrier), so the load span's trace id
+        # would match the calculate span's trace id even without a parent-child relationship; the
+        # assertions below on span.parent are what actually pin the nesting.
+        shared_kwargs: dict[str, Any] = (
+            {"run_id": "018f1e4a-7c3b-7c3b-8c3b-1234567890ab"}
+            if parenting == "run_id"
+            else {"carrier": inject_parent_carrier()[0]}
+        )
+
+        outer_context = make_hook_context(hook=ExtenderHook.FEATURE_GROUP_CALCULATE_FEATURE, **shared_kwargs)
+        inner_context = make_hook_context(hook=ExtenderHook.INPUT_DATA_LOAD, **shared_kwargs)
+
+        def outer_func() -> None:
+            with inner_context.activate():
+                extender(lambda: "loaded-data")
+
+        with outer_context.activate():
+            extender(outer_func)
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 2, spans
+
+        expected = self.expected_span_names()
+        if expected is not None and ExtenderHook.INPUT_DATA_LOAD in expected:
+            load_span = next(span for span in spans if span.name == expected[ExtenderHook.INPUT_DATA_LOAD])
+            calculate_span = next(span for span in spans if span is not load_span)
+        else:
+            span_ids = {span.context.span_id for span in spans if span.context is not None}
+            load_span = next(span for span in spans if span.parent is not None and span.parent.span_id in span_ids)
+            calculate_span = next(span for span in spans if span is not load_span)
+
+        assert calculate_span.context is not None
+        assert load_span.context is not None
+        assert load_span.context.trace_id == calculate_span.context.trace_id
+        assert load_span.parent is not None
+        assert load_span.parent.span_id == calculate_span.context.span_id
+
     def test_otel_run_all_spans_share_one_trace_id(self) -> None:
         provider, exporter = make_span_capture()
         run_two_features(self.make_otel_extender(provider))
