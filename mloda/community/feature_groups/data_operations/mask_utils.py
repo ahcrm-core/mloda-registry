@@ -189,6 +189,8 @@ def apply_pyarrow_mask(
 
 
 def build_sql_case_when(
+    engine_cls: type[BaseMaskEngine],
+    data: Any,
     mask_spec: list[tuple[str, str, Any]],
     source_expr: str,
 ) -> str:
@@ -201,16 +203,12 @@ def build_sql_case_when(
 
     *source_expr* should already be a quoted identifier (via ``quote_ident``).
     """
-    from mloda_plugins.compute_framework.base_implementations.sql.sql_base_mask_engine import (
-        SqlBaseMaskEngine,
-    )
-
     conditions = []
     for col, op, val in mask_spec:
         if op == "equal" and val is None:
             conditions.append(f"{quote_ident(col)} IS NULL")
         else:
-            conditions.append(_engine_op(SqlBaseMaskEngine, None, col, op, val))  # type: ignore[type-abstract]
+            conditions.append(_engine_op(engine_cls, data, col, op, val))
 
     where_clause = " AND ".join(conditions)
     return f"CASE WHEN {where_clause} THEN {source_expr} END"
