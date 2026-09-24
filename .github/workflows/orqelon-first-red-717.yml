@@ -1,4 +1,4 @@
-name: ORQELON First Red 717
+name: ORQELON Regression 717
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  first-red:
+  regression:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,5 +17,5 @@ jobs:
           python-version: "3.12"
       - name: Install dev dependencies
         run: uv sync --all-packages --extra dev
-      - name: Run focused issue 717 First Red
-        run: uv run pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildSqlCaseWhen::test_issue_717_duckdb_greater_equal_excludes_nan -q -s
+      - name: Run issue 717 mask regression
+        run: uv run pytest           mloda/community/feature_groups/data_operations/tests/test_mask_utils.py           mloda/community/feature_groups/data_operations/aggregation           mloda/community/feature_groups/data_operations/row_preserving/window_aggregation           mloda/community/feature_groups/data_operations/row_preserving/frame_aggregate           mloda/community/feature_groups/data_operations/row_preserving/scalar_aggregate           mloda/community/feature_groups/data_operations/row_preserving/percentile           -q
