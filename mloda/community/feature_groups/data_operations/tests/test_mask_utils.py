@@ -162,3 +162,12 @@ class TestBuildSqlCaseWhen:
         result = build_sql_case_when([("col", "equal", None)], '"src"')
         assert "IS NULL" in result
         assert "= NULL" not in result
+
+    def test_issue_717_duckdb_greater_equal_excludes_nan(self) -> None:
+        duckdb = pytest.importorskip("duckdb")
+
+        relation = duckdb.sql("SELECT * FROM (VALUES (1.0, 10), ('NaN'::DOUBLE, 20), (3.0, 30)) t(score, value)")
+        case_expr = build_sql_case_when([("score", "greater_equal", 2.0)], '"value"')
+        result = relation.project(f"{case_expr} AS masked_value").fetchall()
+
+        assert result == [(None,), (None,), (30,)]
