@@ -84,9 +84,10 @@ class AuditExtender(Extender):
     calculation. A missing required identity yields a deny record while the calculation still
     runs. With raise_on_error=True (default), a sink failure after a successful calculation fails
     the run; when the calculation itself fails, its exception wins and the sink failure is only logged.
-    With fail_closed=True (needs raise_on_error=True), a missing identity writes the deny record and
-    raises IdentityRequiredError before the wrapped call, also at FEATURE_GROUP_MATCHED, and runs
-    outermost (priority 0).
+    With fail_closed=True, a missing identity writes the deny record and raises IdentityRequiredError
+    before the wrapped call, also at FEATURE_GROUP_MATCHED, and runs outermost (priority 0). fail_closed=True
+    declares core's never_fall_back, so raise_on_error has no effect on it: the refusal, and a sink
+    failure on the refusal path or after a successful call, always propagate. fail_closed is read-only.
     Records also list the distinct data loads the call attempted, as index-aligned identity and format
     lists ([] for none; a load without an identity is omitted). URI query, fragment, `;` and `&` parameters
     and user information are stripped, best effort; other identities are recorded as given, so not
@@ -111,11 +112,6 @@ class AuditExtender(Extender):
         if len(set(required_identity)) != len(required_identity):
             raise ValueError(f"AuditExtender required_identity has duplicate name(s): {required_identity}")
         _require_sink_write("AuditExtender", sink)
-        if fail_closed and not raise_on_error:
-            raise ValueError(
-                "AuditExtender fail_closed=True requires raise_on_error=True: with raise_on_error=False core "
-                "would log the refusal and still run the wrapped call"
-            )
         if fail_closed and not required_identity:
             raise ValueError(
                 "AuditExtender fail_closed=True needs a non-empty required_identity, else nothing is refused"
@@ -125,13 +121,19 @@ class AuditExtender(Extender):
         self.sink = sink
         self.required_identity = required_identity
         self.raise_on_error = raise_on_error
-        self.fail_closed = fail_closed
+        self._fail_closed = fail_closed
         self.policy_version = (
             policy_version if policy_version is not None else _gate_fingerprint(fail_closed, required_identity)
         )
         if fail_closed:
             # Core runs the lowest priority outermost; a lower-priority peer would otherwise run before the gate.
             self.priority = 0
+            self.never_fall_back = True
+
+    @property
+    def fail_closed(self) -> bool:
+        """Read-only: fixed at construction, never a value set later."""
+        return self._fail_closed
 
     def wraps(self) -> set[ExtenderHook]:
         if self.fail_closed:
@@ -182,7 +184,8 @@ class AuditExtender(Extender):
             raise
 
         # Unguarded on purpose: a sink failure here must propagate (raise_on_error controls the
-        # fallback), never be swallowed alongside a result that was already computed successfully.
+        # fallback, or never_fall_back under fail_closed), never be swallowed alongside a result that
+        # was already computed successfully.
         # context.status is only set by core's instrument() wrapper; without it, the call still succeeded.
         record = self._build_record(context, loads, status=context.status or "success", error_type=None)
         self.sink.write(record)
