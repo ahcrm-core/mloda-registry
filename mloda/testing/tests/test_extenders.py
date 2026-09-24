@@ -5,10 +5,12 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import pickle  # nosec
+import threading
+import time
 from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pyarrow as pa
 import pytest
@@ -17,6 +19,7 @@ from mloda.user import ParallelizationMode, mloda
 
 from mloda.testing.extenders import runners
 from mloda.testing.extenders.contract import ExtenderContractTestMixin
+from mloda.testing.extenders.flush import blocking_flush_provider, call_with_join_timeout
 from mloda.testing.extenders.hook_context import make_hook_context
 from mloda.testing.extenders.runners import (
     CountingExtender,
@@ -533,6 +536,36 @@ class TestMakeRealWorkerExtenderAndMarkerMustBeDeclared:
             )
 
 
+class TestMakeRealWorkerBufferedExtenderAndMarkerMustBeDeclared:
+    def test_default_raises_not_implemented_error(self, tmp_path: Path) -> None:
+        with pytest.raises(NotImplementedError):
+            ExtenderContractTestMixin().make_real_worker_buffered_extender_and_marker(tmp_path)
+
+    def test_undeclared_host_errors_instead_of_skipping_sink_gated_test(
+        self, tmp_path: Path, request: pytest.FixtureRequest, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        class _UndeclaredHost(ExtenderContractTestMixin):
+            @classmethod
+            def extender_class(cls) -> type[Extender]:
+                return _ProbeExtender
+
+            def make_extender(self, *, raise_on_error: bool | None = None) -> _ProbeExtender:
+                return _ProbeExtender(sink=[])
+
+            @classmethod
+            def has_backend_sink(cls) -> bool:
+                return False
+
+            @classmethod
+            def supports_real_worker_buffered_sink(cls) -> bool:
+                return True
+
+        with pytest.raises(NotImplementedError):
+            _UndeclaredHost().test_contract_real_worker_multiprocessing_flushes_buffered_sink_on_close(
+                tmp_path, request, caplog
+            )
+
+
 class TestCountingExtender:
     """CountingExtender: breaking pass-through probe that counts its own invocations."""
 
@@ -601,10 +634,14 @@ class TestExtenderContractTestMixinShape:
             "test_contract_real_worker_multiprocessing_unpicklable_sink_degrades_gracefully",
             "test_contract_pickled_copy_with_sdk_defaults_resolves_ambient_sink",
             "test_contract_run_all_input_data_load_leaves_result_unchanged",
+            "test_contract_real_worker_multiprocessing_flushes_buffered_sink_on_close",
         ],
     )
     def test_new_contract_tests_exist(self, name: str) -> None:
         assert hasattr(ExtenderContractTestMixin, name)
+
+    def test_supports_real_worker_buffered_sink_defaults_to_false(self) -> None:
+        assert ExtenderContractTestMixin.supports_real_worker_buffered_sink() is False
 
 
 class TestProbeExtenderDeclaredHooks(ExtenderContractTestMixin):
@@ -633,3 +670,78 @@ class TestProbeExtenderDeclaredHooks(ExtenderContractTestMixin):
 
     def own_failure(self) -> AbstractContextManager[Any]:
         return patch.object(_ProbeExtender, "explode", True, create=True)
+
+
+class TestCallWithJoinTimeout:
+    """call_with_join_timeout(func, join_timeout=...) never blocks past join_timeout, however long func
+    itself actually takes."""
+
+    def test_a_fast_func_returns_finished_with_its_result(self) -> None:
+        still_running, outcome = call_with_join_timeout(lambda: 42, join_timeout=1.0)
+
+        assert still_running is False
+        assert outcome == {"result": 42}
+
+    def test_a_raising_func_captures_the_exception_instead_of_propagating_it(self) -> None:
+        def raise_boom() -> None:
+            raise RuntimeError("boom")
+
+        still_running, outcome = call_with_join_timeout(raise_boom, join_timeout=1.0)
+
+        assert still_running is False
+        assert isinstance(outcome.get("error"), RuntimeError)
+        assert str(outcome["error"]) == "boom"
+
+    def test_a_slow_func_is_reported_as_still_running_without_blocking(self) -> None:
+        release = threading.Event()
+
+        def blocked() -> str:
+            release.wait()
+            return "late"
+
+        try:
+            start = time.monotonic()
+            still_running, outcome = call_with_join_timeout(blocked, join_timeout=0.1)
+            elapsed = time.monotonic() - start
+        finally:
+            release.set()
+
+        assert still_running is True
+        assert outcome == {}
+        assert elapsed < 1.0, elapsed
+
+
+class TestBlockingFlushProvider:
+    """blocking_flush_provider() yields a Mock whose force_flush(timeout_millis=...) ignores the
+    timeout and blocks until the context exits, releasing its Event on exit either way."""
+
+    def test_force_flush_blocks_until_the_context_exits(self) -> None:
+        with blocking_flush_provider() as provider:
+            still_running, outcome = call_with_join_timeout(
+                lambda: provider.force_flush(timeout_millis=1), join_timeout=0.1
+            )
+            assert still_running is True
+            assert outcome == {}
+
+        # The context's __exit__ released the Event, so a fresh call now returns immediately.
+        still_running, outcome = call_with_join_timeout(
+            lambda: provider.force_flush(timeout_millis=1), join_timeout=1.0
+        )
+        assert still_running is False
+        assert outcome == {"result": True}
+
+    def test_the_event_is_released_even_when_the_body_raises(self) -> None:
+        with pytest.raises(RuntimeError, match="body boom"):
+            with blocking_flush_provider() as provider:
+                raise RuntimeError("body boom")
+
+        still_running, outcome = call_with_join_timeout(
+            lambda: provider.force_flush(timeout_millis=1), join_timeout=1.0
+        )
+        assert still_running is False
+        assert outcome == {"result": True}
+
+    def test_yields_a_mock_whose_force_flush_is_a_mock(self) -> None:
+        with blocking_flush_provider() as provider:
+            assert isinstance(provider, Mock)
+            assert isinstance(provider.force_flush, Mock)

@@ -76,6 +76,17 @@ class LockHoldingTransport(Transport):
         self.events.append(event)
 
 
+def _event_type_line(owner: str, event: Event) -> str | None:
+    """The one line a file-backed transport appends per emitted event's type; None means nothing to
+    write (event.eventType unset). Shared by FileTransport and BufferingFileTransport so both reject
+    a non-RunEvent and skip an eventType-less event identically."""
+    if not isinstance(event, RunEvent):
+        raise TypeError(f"{owner} only records RunEvent, got {type(event).__name__}")
+    if event.eventType is None:
+        return None
+    return f"{event.eventType.value}\n"
+
+
 class FileTransport(Transport):
     """Appends one line per emitted event's type to marker_path, so an event can be observed from
     inside a real spawned worker process."""
@@ -87,12 +98,39 @@ class FileTransport(Transport):
         self._marker_path = marker_path
 
     def emit(self, event: Event) -> None:
-        if not isinstance(event, RunEvent):
-            raise TypeError(f"FileTransport only records RunEvent, got {type(event).__name__}")
-        if event.eventType is None:
+        line = _event_type_line(type(self).__name__, event)
+        if line is None:
             return
         with open(self._marker_path, "a") as handle:
-            handle.write(f"{event.eventType.value}\n")
+            handle.write(line)
+
+
+class BufferingFileTransport(Transport):
+    """Buffers each emitted event's type in memory and appends it to marker_path only on close(), so
+    a marker only exists once close() actually ran with something to write (proving a worker's
+    graceful-exit flush drained real buffered content, not merely that close() was called)."""
+
+    kind = "buffering-file-transport"
+    config_class = Config
+
+    def __init__(self, marker_path: Path) -> None:
+        self._marker_path = marker_path
+        self._buffer: list[str] = []
+
+    def emit(self, event: Event) -> None:
+        line = _event_type_line(type(self).__name__, event)
+        if line is None:
+            return
+        self._buffer.append(line)
+
+    def close(self, timeout: float = -1.0) -> bool:
+        if not self._buffer:
+            return True
+        with open(self._marker_path, "a") as handle:
+            for line in self._buffer:
+                handle.write(line)
+        self._buffer = []
+        return True
 
 
 class _PidTaggedFileTransport(Transport):
