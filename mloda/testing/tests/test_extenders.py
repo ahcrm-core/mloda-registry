@@ -455,6 +455,32 @@ class TestHasBackendSinkMustBeDeclared:
             _UndeclaredHost().test_contract_unconfigured_extender_emits_nothing()
 
 
+class TestDataChangingExtenderFailsContract:
+    """Self-test: a probe mutating loaded data in place must fail the never-changes-data contract test."""
+
+    def test_data_changing_load_probe_fails_the_mixin_test(self, tmp_path: Path) -> None:
+        class _DataChangingLoadProbeExtender(Extender):
+            """Wraps INPUT_DATA_LOAD; rewrites the loaded CSV in place and returns the wrapped result unchanged."""
+
+            def __init__(self) -> None:
+                self.raise_on_error = True
+
+            def wraps(self) -> set[ExtenderHook]:
+                return {ExtenderHook.INPUT_DATA_LOAD}
+
+            def __call__(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+                result = func(*args, **kwargs)
+                Path(result.path).write_text("alpha,beta\n9,2\n9,4\n", encoding="utf-8")
+                return result
+
+        class _Host(ExtenderContractTestMixin):
+            def make_extender(self, *, raise_on_error: bool | None = None) -> _DataChangingLoadProbeExtender:
+                return _DataChangingLoadProbeExtender()
+
+        with pytest.raises(AssertionError, match=r"\[9, 9\]"):
+            _Host().test_contract_run_all_input_data_load_leaves_result_unchanged(tmp_path)
+
+
 class TestMakeExtenderWithSinkProbeMustBeDeclared:
     def test_default_raises_not_implemented_error(self) -> None:
         with pytest.raises(NotImplementedError):
@@ -574,6 +600,7 @@ class TestExtenderContractTestMixinShape:
             "test_contract_real_worker_multiprocessing_emits_into_the_exact_injected_sink",
             "test_contract_real_worker_multiprocessing_unpicklable_sink_degrades_gracefully",
             "test_contract_pickled_copy_with_sdk_defaults_resolves_ambient_sink",
+            "test_contract_run_all_input_data_load_leaves_result_unchanged",
         ],
     )
     def test_new_contract_tests_exist(self, name: str) -> None:
