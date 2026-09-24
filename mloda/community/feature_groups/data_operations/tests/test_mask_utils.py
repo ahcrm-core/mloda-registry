@@ -72,8 +72,8 @@ class TestBuildPolarsMaskExpr:
     def test_single_equal(self) -> None:
         pl = pytest.importorskip("polars")
 
-        expr = build_polars_mask_expr([("status", "equal", "active")])
         df = pl.DataFrame({"status": ["active", "inactive", "active"]})
+        expr = build_polars_mask_expr(df.lazy(), [("status", "equal", "active")])
         result = df.lazy().filter(expr).collect()
         assert result.shape == (2, 1)
         assert result["status"].to_list() == ["active", "active"]
@@ -81,16 +81,16 @@ class TestBuildPolarsMaskExpr:
     def test_multiple_conditions(self) -> None:
         pl = pytest.importorskip("polars")
 
-        expr = build_polars_mask_expr([("cat", "equal", "X"), ("val", "greater_equal", 10)])
         df = pl.DataFrame({"cat": ["X", "X", "Y"], "val": [15, 5, 20]})
+        expr = build_polars_mask_expr(df.lazy(), [("cat", "equal", "X"), ("val", "greater_equal", 10)])
         result = df.lazy().filter(expr).collect()
         assert result.shape == (1, 2)
 
     def test_is_in(self) -> None:
         pl = pytest.importorskip("polars")
 
-        expr = build_polars_mask_expr([("col", "is_in", ["a", "b"])])
         df = pl.DataFrame({"col": ["a", "c", "b"]})
+        expr = build_polars_mask_expr(df.lazy(), [("col", "is_in", ["a", "b"])])
         result = df.lazy().filter(expr).collect()
         assert result.shape == (2, 1)
 
@@ -103,8 +103,8 @@ class TestBuildPolarsMaskExpr:
             ("less_than", 2, 1),
             ("less_equal", 2, 2),
         ]:
-            expr = build_polars_mask_expr([("x", op, test_val)])
             df = pl.DataFrame({"x": [1, 2, 3]})
+            expr = build_polars_mask_expr(df.lazy(), [("x", op, test_val)])
             result = df.lazy().filter(expr).collect()
             assert result.shape[0] == expected_count, f"Failed for {op}"
 
