@@ -1,4 +1,4 @@
-name: ORQELON Cross Framework 717
+name: ORQELON Issue 717 Regression
 
 on:
   push:
@@ -17,5 +17,12 @@ jobs:
           python-version: "3.12"
       - name: Install dev dependencies
         run: uv sync --all-packages --extra dev
-      - name: Run issue 717 cross-framework parity
-        run: uv run pytest mloda/community/feature_groups/data_operations/aggregation/tests/test_issue_717_cross_framework.py -q -s
+      - name: Run issue 717 regression
+        run: uv run pytest \
+            mloda/community/feature_groups/data_operations/tests/test_mask_utils.py \
+            mloda/community/feature_groups/data_operations/aggregation/tests \
+            mloda/community/feature_groups/data_operations/row_preserving/window_aggregation/tests \
+            mloda/community/feature_groups/data_operations/row_preserving/frame_aggregate/tests \
+            mloda/community/feature_groups/data_operations/row_preserving/scalar_aggregate/tests \
+            mloda/community/feature_groups/data_operations/row_preserving/percentile/tests \
+            -q
