@@ -20,8 +20,6 @@ from __future__ import annotations
 from typing import Any
 
 from mloda.provider import BaseMaskEngine
-from mloda_plugins.compute_framework.base_implementations.sql.sql_utils import quote_ident
-
 MASK_KEY = "mask"
 
 _SUPPORTED_OPS: frozenset[str] = frozenset(
@@ -176,14 +174,13 @@ def apply_pyarrow_mask(
     not matching the mask have null values.
     """
     import pyarrow as pa
-    import pyarrow.compute as pc
     from mloda_plugins.compute_framework.base_implementations.pyarrow.pyarrow_mask_engine import (
         PyArrowMaskEngine,
     )
 
     mask = build_mask_from_spec(PyArrowMaskEngine, table, mask_spec)
     null_scalar = pa.scalar(None, type=table.schema.field(source_col).type)
-    masked_col = pc.if_else(pc.fill_null(mask, False), table.column(source_col), null_scalar)
+    masked_col = pa.compute.if_else(mask, table.column(source_col), null_scalar)
     col_idx = table.schema.get_field_index(source_col)
     return table.set_column(col_idx, source_col, masked_col)
 
@@ -196,19 +193,14 @@ def build_sql_case_when(
 ) -> str:
     """Build a SQL ``CASE WHEN ... THEN source END`` expression.
 
-    Delegates individual conditions to upstream ``SqlBaseMaskEngine`` instead
-    of hand-rolling operator dispatch.  The IS NULL case is handled explicitly
-    because upstream ``SqlBaseMaskEngine.equal(data, col, None)`` produces
-    ``"col" = NULL`` rather than the correct ``"col" IS NULL``.
+    Delegates individual conditions to the framework's concrete mask engine
+    so core null/NaN semantics are preserved.
 
-    *source_expr* should already be a quoted identifier (via ``quote_ident``).
+    *source_expr* should already be a quoted identifier.
     """
     conditions = []
     for col, op, val in mask_spec:
-        if op == "equal" and val is None:
-            conditions.append(f"{quote_ident(col)} IS NULL")
-        else:
-            conditions.append(_engine_op(engine_cls, data, col, op, val))
+        conditions.append(_engine_op(engine_cls, data, col, op, val))
 
     where_clause = " AND ".join(conditions)
     return f"CASE WHEN {where_clause} THEN {source_expr} END"
