@@ -127,6 +127,22 @@ class TestBuildPolarsMaskExpr:
 
         assert result[source_col].to_list() == [10, None, 30]
 
+    def test_apply_polars_mask_greater_equal_uses_lazyframe_schema(self) -> None:
+        pl = pytest.importorskip("polars")
+
+        from mloda.community.feature_groups.data_operations.mask_utils import apply_polars_mask
+
+        data = pl.DataFrame({"score": [1.0, float("nan"), 3.0], "value": [10, 20, 30]}).lazy()
+
+        masked, source_col = apply_polars_mask(
+            data,
+            "value",
+            [("score", "greater_equal", 2.0)],
+        )
+        result = masked.collect()
+
+        assert result[source_col].to_list() == [None, None, 30]
+
 
 class TestBuildSqlCaseWhen:
     @pytest.mark.parametrize(
