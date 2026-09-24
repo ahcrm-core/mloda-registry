@@ -24,7 +24,7 @@ jobs:
           echo "=== uv pip show mloda ==="
           uv pip show mloda
           echo "=== installed distribution files ==="
-          uv run python - <<'PY'
+          .venv/bin/python - <<'PY'
           import importlib.metadata as md
           d = md.distribution("mloda")
           print("version:", d.version)
@@ -35,10 +35,10 @@ jobs:
           echo "=== pyproject declared mloda constraints ==="
           grep -R "mloda" -n pyproject.toml uv.lock | head -80
       - name: Show compatibility versions
-        run: uv run python -c "import importlib.metadata; print('mloda', importlib.metadata.version('mloda')); print('polars', importlib.metadata.version('polars'))"
+        run: .venv/bin/python -c "import importlib.metadata; print('mloda', importlib.metadata.version('mloda')); print('polars', importlib.metadata.version('polars'))"
       - name: Inspect imported PolarsExprMaskEngine runtime source
         run: |
-          uv run python - <<'PY'
+          .venv/bin/python - <<'PY'
           import inspect
           import mloda_plugins.compute_framework.base_implementations.polars.polars_expr_mask_engine as module
           print("runtime module file:", module.__file__)
@@ -47,4 +47,4 @@ jobs:
           print(inspect.getsource(module.PolarsExprMaskEngine.is_in))
           PY
       - name: Run focused regression test
-        run: uv run pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildPolarsMaskExpr::test_issue_715_direct_upstream_reproduction -q -s
+        run: .venv/bin/pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildPolarsMaskExpr::test_issue_715_direct_upstream_reproduction -q -s
