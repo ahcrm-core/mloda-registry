@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-packages --extra dev
       - name: Install current mloda main for compatibility First Red
-        run: uv pip install "mloda @ git+https://github.com/mloda-ai/mloda.git@main"
+        run: uv pip install --reinstall "mloda @ git+https://github.com/mloda-ai/mloda.git@754e6f0305d25fbbe69b30fa9ce71b1a80c4442d"
       - name: Show compatibility versions
         run: uv run python -c "import importlib.metadata; print('mloda', importlib.metadata.version('mloda')); print('polars', importlib.metadata.version('polars'))"
       - name: Inspect imported PolarsExprMaskEngine runtime source
@@ -27,6 +27,7 @@ jobs:
           import inspect
           import mloda_plugins.compute_framework.base_implementations.polars.polars_expr_mask_engine as module
           print("runtime module file:", module.__file__)
+          print("runtime mloda distribution:", __import__("importlib.metadata").metadata.version("mloda"))
           print("runtime is_in source:")
           print(inspect.getsource(module.PolarsExprMaskEngine.is_in))
           PY
