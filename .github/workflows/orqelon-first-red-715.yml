@@ -47,4 +47,4 @@ jobs:
           print(inspect.getsource(module.PolarsExprMaskEngine.is_in))
           PY
       - name: Run focused regression test
-        run: .venv/bin/pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildPolarsMaskExpr::test_issue_715_direct_upstream_reproduction -q -s
+        run: .venv/bin/pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildPolarsMaskExpr::test_apply_polars_mask_is_in_uses_lazyframe -q -s
