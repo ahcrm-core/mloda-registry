@@ -18,7 +18,8 @@ jobs:
       - name: Install dev dependencies
         run: uv sync --all-packages --extra dev
       - name: Run issue 717 regression
-        run: uv run pytest \
+        run: |
+          uv run pytest \
             mloda/community/feature_groups/data_operations/tests/test_mask_utils.py \
             mloda/community/feature_groups/data_operations/aggregation/tests \
             mloda/community/feature_groups/data_operations/row_preserving/window_aggregation/tests \
