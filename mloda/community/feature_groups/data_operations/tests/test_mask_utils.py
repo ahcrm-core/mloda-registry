@@ -176,3 +176,25 @@ class TestBuildSqlCaseWhen:
         result = relation.project(f"{case_expr} AS masked_value").fetchall()
 
         assert result == [(None,), (None,), (30,)]
+
+    @pytest.mark.parametrize(
+        ("operator", "threshold", "expected"),
+        [
+            pytest.param("greater_than", 4.0, [(None,), (None,), (50,)], id="greater_than"),
+            pytest.param("greater_equal", 5.0, [(None,), (None,), (50,)], id="greater_equal"),
+        ],
+    )
+    def test_issue_717_fresh_duckdb_nan_holdout(
+        self, operator: str, threshold: float, expected: list[tuple[int | None]]
+    ) -> None:
+        duckdb = pytest.importorskip("duckdb")
+
+        relation = duckdb.sql(
+            "SELECT * FROM (VALUES (2.0, 20), ('NaN'::DOUBLE, 40), (5.0, 50)) t(metric, payload)"
+        )
+        case_expr = build_sql_case_when(
+            DuckDBMaskEngine, relation, [("metric", operator, threshold)], '"payload"'
+        )
+        result = relation.project(f"{case_expr} AS masked_payload").fetchall()
+
+        assert result == expected
