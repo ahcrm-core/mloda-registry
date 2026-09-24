@@ -127,7 +127,10 @@ def _engine_op(
     raise ValueError(f"Unsupported mask operator: {op}")
 
 
-def build_polars_mask_expr(mask_spec: list[tuple[str, str, Any]]) -> Any:
+def build_polars_mask_expr(
+    data: Any,
+    mask_spec: list[tuple[str, str, Any]],
+) -> Any:
     """Build a lazy-compatible Polars boolean expression from a mask spec.
 
     Returns a ``pl.Expr`` that evaluates to a boolean column.  Delegates to
@@ -139,7 +142,7 @@ def build_polars_mask_expr(mask_spec: list[tuple[str, str, Any]]) -> Any:
 
     expr: Any = None
     for col, op, val in mask_spec:
-        single = _engine_op(PolarsExprMaskEngine, None, col, op, val)
+        single = _engine_op(PolarsExprMaskEngine, data, col, op, val)
         expr = single if expr is None else PolarsExprMaskEngine.combine(expr, single)
     return expr
 
@@ -162,7 +165,7 @@ def apply_polars_mask(
     """
     import polars as pl
 
-    mask_expr = build_polars_mask_expr(mask_spec)
+    mask_expr = build_polars_mask_expr(data, mask_spec)
     data = data.with_columns(pl.when(mask_expr).then(pl.col(source_col)).otherwise(None).alias(_POLARS_MASK_TMP))
     return data, _POLARS_MASK_TMP
 
