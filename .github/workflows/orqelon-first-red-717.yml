@@ -1,0 +1,21 @@
+name: ORQELON First Red 717
+
+on:
+  push:
+    branches:
+      - fix/717-duckdb-nan-mask-first-red
+  workflow_dispatch:
+
+jobs:
+  first-red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dev dependencies
+        run: uv sync --all-packages --extra dev
+      - name: Run focused issue 717 First Red
+        run: uv run pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildSqlCaseWhen::test_issue_717_duckdb_greater_equal_excludes_nan -q -s
