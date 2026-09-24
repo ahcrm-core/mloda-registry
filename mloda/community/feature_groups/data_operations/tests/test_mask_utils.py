@@ -127,6 +127,18 @@ class TestBuildPolarsMaskExpr:
 
         assert result[source_col].to_list() == [10, None, 30]
 
+    def test_issue_715_direct_upstream_reproduction(self) -> None:
+        pytest.importorskip("polars")
+
+        import importlib.metadata
+
+        from mloda_plugins.compute_framework.base_implementations.polars.polars_expr_mask_engine import (
+            PolarsExprMaskEngine,
+        )
+
+        print(f"mloda version: {importlib.metadata.version('mloda')}")
+        PolarsExprMaskEngine.is_in(None, "status", ["active"])
+
     def test_apply_polars_mask_greater_equal_uses_lazyframe_schema(self) -> None:
         pl = pytest.importorskip("polars")
 
