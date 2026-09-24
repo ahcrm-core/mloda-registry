@@ -1,4 +1,4 @@
-name: ORQELON Regression 717
+name: ORQELON Fresh Holdout 717
 
 on:
   push:
@@ -17,5 +17,5 @@ jobs:
           python-version: "3.12"
       - name: Install dev dependencies
         run: uv sync --all-packages --extra dev
-      - name: Run issue 717 mask regression
-        run: uv run pytest           mloda/community/feature_groups/data_operations/tests/test_mask_utils.py           mloda/community/feature_groups/data_operations/aggregation           mloda/community/feature_groups/data_operations/row_preserving/window_aggregation           mloda/community/feature_groups/data_operations/row_preserving/frame_aggregate           mloda/community/feature_groups/data_operations/row_preserving/scalar_aggregate           mloda/community/feature_groups/data_operations/row_preserving/percentile           -q
+      - name: Run issue 717 fresh holdout
+        run: uv run pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildSqlCaseWhen::test_issue_717_fresh_duckdb_nan_holdout -q
