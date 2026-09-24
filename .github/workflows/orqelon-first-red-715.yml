@@ -17,5 +17,9 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: uv sync --all-packages --extra dev
+      - name: Install current mloda main for compatibility First Red
+        run: uv pip install "mloda @ git+https://github.com/mloda-ai/mloda.git@main"
+      - name: Show compatibility versions
+        run: uv run python -c "import importlib.metadata; print('mloda', importlib.metadata.version('mloda')); print('polars', importlib.metadata.version('polars'))"
       - name: Run focused regression test
         run: uv run pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildPolarsMaskExpr::test_issue_715_direct_upstream_reproduction -q -s
