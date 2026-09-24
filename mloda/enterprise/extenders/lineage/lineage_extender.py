@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import attr
@@ -14,9 +17,13 @@ from openlineage.client.facet_v2 import RunFacet, column_lineage_dataset, data_q
 
 from mloda.community.extenders.openlineage.openlineage_extender import OpenLineageExtender
 from mloda.community.extenders.shared.bound_method import bound_method, class_attribute
+from mloda.community.extenders.shared.data_access_identity import resolve_data_access_identity
+from mloda.community.extenders.shared.open_invocations import OpenInvocationStack
 
 if TYPE_CHECKING:
     from mloda.user import Feature
+
+logger = logging.getLogger(__name__)
 
 _PRODUCER = "https://github.com/mloda-ai/mloda-registry/tree/main/mloda/enterprise/extenders/lineage"
 _SCHEMA_URL = (
@@ -29,6 +36,29 @@ _VALIDATOR_METHODS: dict[ExtenderHook, str] = {
     ExtenderHook.VALIDATE_INPUT_FEATURE: "validate_input_features",
     ExtenderHook.VALIDATE_OUTPUT_FEATURE: "validate_output_features",
 }
+
+# A pending describe call: () -> a raw describe_columns() result, or None if the load has nothing to call.
+_PendingDescribe = Callable[[], Any] | None
+
+
+@dataclass
+class _LoadState:
+    """One open calculate call's per-identity pending loads, described lazily and once each, on first use."""
+
+    _pending: dict[str, list[_PendingDescribe]] = field(default_factory=dict)
+    _described: dict[str, frozenset[str] | None] = field(default_factory=dict)
+
+    def record(self, identity: str, pending: _PendingDescribe) -> None:
+        self._pending.setdefault(identity, []).append(pending)
+
+    def described_columns(self, identity: str) -> frozenset[str] | None:
+        if identity not in self._described:
+            self._described[identity] = _describe_identity(self._pending.get(identity, []))
+        return self._described[identity]
+
+
+# Per open calculate call: the pending loads and described-columns cache, or None if nothing to verify.
+_open_described_columns: OpenInvocationStack[_LoadState | None] = OpenInvocationStack("lineage_open_described_columns")
 
 
 @attr.define
@@ -58,6 +88,26 @@ class LineageFacetsExtender(OpenLineageExtender):
             return self._call_validator(context, func, args, kwargs)
         return super()._dispatch(context, func, args, kwargs)
 
+    def _call_input_data_load(self, context: HookContext, func: Any, *args: Any, **kwargs: Any) -> Any:
+        result = super()._call_input_data_load(context, func, *args, **kwargs)
+        self._record_pending_describe(context, func, args)
+        return result
+
+    def _call_calculate_feature(self, context: HookContext, func: Any, *args: Any, **kwargs: Any) -> Any:
+        # Opened around the whole calculate call, so loads recorded into it are visible when facets are built.
+        state = _LoadState() if _source_columns(context, func, args) else None
+        with _open_described_columns.open(self, state):
+            return super()._call_calculate_feature(context, func, *args, **kwargs)
+
+    def _record_pending_describe(self, context: HookContext, func: Any, args: tuple[Any, ...]) -> None:
+        state = _open_described_columns.find(self)
+        if state is None:
+            return
+        identity = resolve_data_access_identity(args, context.data_access_identity)
+        if identity is None:
+            return
+        state.record(identity, _pending_describe(func, args))
+
     def _calculate_run_facets(self, context: HookContext, func: Any, args: tuple[Any, ...]) -> dict[str, Any]:
         facets = super()._calculate_run_facets(context, func, args)
         masked = _masked_features(context, func, args)
@@ -82,6 +132,19 @@ class LineageFacetsExtender(OpenLineageExtender):
             column = _source_column(func, args, name)
             # With several loaded datasets it is unknown which one holds the column.
             if column is None or len(inputs) != 1:
+                return facets
+            state = _open_described_columns.find(self)
+            identity_columns = state.described_columns(inputs[0].name) if state is not None else None
+            if identity_columns is not None and column not in identity_columns:
+                # No dataset identity: it may carry credentials, e.g. a keyword DSN.
+                logger.warning(
+                    "%s: %s output %r declares lineage_source_column %r, not found among its dataset's "
+                    "described columns; no columnLineage edge is emitted",
+                    type(self).__name__,
+                    context.feature_group_class,
+                    name,
+                    column,
+                )
                 return facets
             edges = [(inputs[0].namespace, inputs[0].name, column)]
             description = None
@@ -202,6 +265,39 @@ def _source_columns(context: HookContext, func: Any, args: tuple[Any, ...]) -> l
         return []
     columns = ((name, _source_column(func, args, name)) for name in sorted(context.feature_names))
     return [[name, column] for name, column in columns if column is not None]
+
+
+def _pending_describe(func: Any, args: tuple[Any, ...]) -> _PendingDescribe:
+    """None when the load has no reader owning it or no positional data_access; else a deferred describe call."""
+    describe = class_attribute(func, "describe_columns")
+    if describe is None or not args:
+        return None
+    data_access = args[0]
+    return lambda: describe(data_access)
+
+
+def _resolve_pending(pending: _PendingDescribe) -> frozenset[str] | None:
+    """A raising describer, or a result that is not a mapping of str keys, counts as undescribable."""
+    if pending is None:
+        return None
+    try:
+        result = pending()
+    except Exception:
+        return None
+    if not isinstance(result, Mapping) or not all(isinstance(key, str) for key in result):
+        return None
+    return frozenset(result)
+
+
+def _describe_identity(pending: list[_PendingDescribe]) -> frozenset[str] | None:
+    """The union of every load's described columns, or None once one load of the identity cannot be described."""
+    described: frozenset[str] = frozenset()
+    for one_pending in pending:
+        columns = _resolve_pending(one_pending)
+        if columns is None:
+            return None
+        described |= columns
+    return described
 
 
 def _masked_features(context: HookContext, func: Any, args: tuple[Any, ...]) -> list[str]:
