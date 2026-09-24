@@ -6,6 +6,9 @@ from typing import Any
 
 import pytest
 
+from mloda_plugins.compute_framework.base_implementations.duckdb.duckdb_mask_engine import DuckDBMaskEngine
+from mloda_plugins.compute_framework.base_implementations.sqlite.sqlite_mask_engine import SqliteMaskEngine
+
 from mloda.community.feature_groups.data_operations.mask_utils import (
     build_polars_mask_expr,
     build_sql_case_when,
@@ -142,11 +145,13 @@ class TestBuildSqlCaseWhen:
         ],
     )
     def test_single_condition(self, column: str, operator: str, value: str | int, expected: str) -> None:
-        result = build_sql_case_when([(column, operator, value)], '"value"')
+        result = build_sql_case_when(SqliteMaskEngine, None, [(column, operator, value)], '"value"')
         assert result == expected
 
     def test_multiple_conditions(self) -> None:
         result = build_sql_case_when(
+            SqliteMaskEngine,
+            None,
             [("cat", "equal", "X"), ("val", "greater_equal", 10)],
             '"source"',
         )
@@ -155,11 +160,11 @@ class TestBuildSqlCaseWhen:
         assert "AND" in result
 
     def test_is_in(self) -> None:
-        result = build_sql_case_when([("col", "is_in", ["a", "b"])], '"src"')
+        result = build_sql_case_when(SqliteMaskEngine, None, [("col", "is_in", ["a", "b"])], '"src"')
         assert "IN ('a', 'b')" in result
 
     def test_equal_none_produces_is_null(self) -> None:
-        result = build_sql_case_when([("col", "equal", None)], '"src"')
+        result = build_sql_case_when(SqliteMaskEngine, None, [("col", "equal", None)], '"src"')
         assert "IS NULL" in result
         assert "= NULL" not in result
 
@@ -167,7 +172,7 @@ class TestBuildSqlCaseWhen:
         duckdb = pytest.importorskip("duckdb")
 
         relation = duckdb.sql("SELECT * FROM (VALUES (1.0, 10), ('NaN'::DOUBLE, 20), (3.0, 30)) t(score, value)")
-        case_expr = build_sql_case_when([("score", "greater_equal", 2.0)], '"value"')
+        case_expr = build_sql_case_when(DuckDBMaskEngine, relation, [("score", "greater_equal", 2.0)], '"value"')
         result = relation.project(f"{case_expr} AS masked_value").fetchall()
 
         assert result == [(None,), (None,), (30,)]
