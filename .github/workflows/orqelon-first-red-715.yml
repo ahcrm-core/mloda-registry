@@ -21,5 +21,14 @@ jobs:
         run: uv pip install "mloda @ git+https://github.com/mloda-ai/mloda.git@main"
       - name: Show compatibility versions
         run: uv run python -c "import importlib.metadata; print('mloda', importlib.metadata.version('mloda')); print('polars', importlib.metadata.version('polars'))"
+      - name: Inspect imported PolarsExprMaskEngine runtime source
+        run: |
+          uv run python - <<'PY'
+          import inspect
+          import mloda_plugins.compute_framework.base_implementations.polars.polars_expr_mask_engine as module
+          print("runtime module file:", module.__file__)
+          print("runtime is_in source:")
+          print(inspect.getsource(module.PolarsExprMaskEngine.is_in))
+          PY
       - name: Run focused regression test
         run: uv run pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildPolarsMaskExpr::test_issue_715_direct_upstream_reproduction -q -s
