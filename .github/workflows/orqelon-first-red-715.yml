@@ -1,0 +1,21 @@
+name: ORQELON First Red - mloda-registry #715
+
+on:
+  push:
+    branches:
+      - fix/715-polars-is-in-mask
+  workflow_dispatch:
+
+jobs:
+  first-red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --all-packages
+      - name: Run focused regression test
+        run: uv run pytest mloda/community/feature_groups/data_operations/tests/test_mask_utils.py::TestBuildPolarsMaskExpr::test_apply_polars_mask_is_in_uses_lazyframe -q
