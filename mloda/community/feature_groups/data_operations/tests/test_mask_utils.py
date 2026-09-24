@@ -109,6 +109,25 @@ class TestBuildPolarsMaskExpr:
             assert result.shape[0] == expected_count, f"Failed for {op}"
 
 
+    def test_apply_polars_mask_is_in_uses_lazyframe(self) -> None:
+        pl = pytest.importorskip("polars")
+
+        from mloda.community.feature_groups.data_operations.mask_utils import apply_polars_mask
+
+        data = pl.DataFrame(
+            {"status": ["active", "inactive", "active"], "value": [10, 20, 30]}
+        ).lazy()
+
+        masked, source_col = apply_polars_mask(
+            data,
+            "value",
+            [("status", "is_in", ["active"])],
+        )
+        result = masked.collect()
+
+        assert result[source_col].to_list() == [10, None, 30]
+
+
 class TestBuildSqlCaseWhen:
     @pytest.mark.parametrize(
         ("column", "operator", "value", "expected"),
