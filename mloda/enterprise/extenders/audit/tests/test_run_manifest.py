@@ -54,7 +54,11 @@ from mloda.enterprise.extenders.audit import (
     verify_ndjson_log_coverage,
 )
 from mloda.enterprise.extenders.audit.audit_extender import _append_records
-from mloda.enterprise.extenders.audit.tests.test_audit_extender import _POLICY_VERSION, InMemoryAuditSink
+from mloda.enterprise.extenders.audit.tests.test_audit_extender import (
+    _POLICY_VERSION,
+    BufferingNdjsonAuditSink,
+    InMemoryAuditSink,
+)
 from mloda.testing.extenders.runners import expected_value_int, run_value_int
 from mloda.testing.import_isolation import block_root, evict_package
 
@@ -4596,6 +4600,144 @@ class TestRunManifestRunAll:
         assert records[0]["hook"] == "FEATURE_GROUP_MATCHED"
         manifests = seal_ndjson_runs(audit_path, manifest_path, signer=_signer())
         verify_ndjson_log(audit_path, manifest_path, signer=_signer())
+
+        assert len(manifests) == 1
+        assert manifests[0]["compliant"] is False
+
+    @pytest.mark.parametrize(
+        ("mode", "fail_closed"),
+        [
+            (ParallelizationMode.SYNC, False),
+            (ParallelizationMode.THREADING, False),
+            (ParallelizationMode.MULTIPROCESSING, False),
+            (ParallelizationMode.MULTIPROCESSING, True),
+        ],
+    )
+    def test_run_all_auto_seals_via_on_run_complete_without_a_manual_seal_call(
+        self, mode: ParallelizationMode, fail_closed: bool, tmp_path: Path, request: pytest.FixtureRequest
+    ) -> None:
+        """AuditExtender.on_run_complete seals the run itself; no seal_ndjson_runs call is made here."""
+        audit_path = tmp_path / "audit.ndjson"
+        manifest_path = tmp_path / "manifests.ndjson"
+        # Only MULTIPROCESSING needs the flight_server fixture.
+        flight_server = (
+            request.getfixturevalue("flight_server") if mode == ParallelizationMode.MULTIPROCESSING else None
+        )
+        signer = _signer()
+        extender = AuditExtender(
+            sink=NdjsonAuditSink(audit_path),
+            audit_path=audit_path,
+            manifest_path=manifest_path,
+            signer=signer,
+            fail_closed=fail_closed,
+        )
+
+        with verified_context(tenant_id="tenant-42", project_id="project-7", principal="svc"):
+            values = run_value_int(extender, parallelization_modes={mode}, flight_server=flight_server)
+
+        assert values == expected_value_int()
+        records = _read_lines(audit_path)
+        assert records
+        manifests = _read_lines(manifest_path)
+        assert len(manifests) == 1
+        manifest = manifests[0]
+        assert manifest["record_count"] == len(records)
+        assert manifest["compliant"] is True
+        head = verify_ndjson_log(audit_path, manifest_path, signer=signer)
+        assert head == manifest_hash(manifest)
+        assert {record["run_id"] for record in records} == {manifest["run_id"]}
+        assert [record["policy_version"] for record in records] == [extender.policy_version] * len(records)
+
+    @_both_algorithms
+    def test_run_all_multiprocessing_auto_seal_waits_for_workers_to_be_joined(
+        self, tmp_path: Path, request: pytest.FixtureRequest
+    ) -> None:
+        """BufferingNdjsonAuditSink only reaches disk on a worker's graceful-exit close(): an auto-seal that
+        ran before the workers were joined would see an empty (or partial) audit file."""
+        audit_path = tmp_path / "audit.ndjson"
+        manifest_path = tmp_path / "manifests.ndjson"
+        flight_server = request.getfixturevalue("flight_server")
+        signer = _signer()
+        sink = BufferingNdjsonAuditSink(audit_path)
+        extender = AuditExtender(sink=sink, audit_path=audit_path, manifest_path=manifest_path, signer=signer)
+
+        with verified_context(tenant_id="tenant-42"):
+            values = run_value_int(
+                extender, parallelization_modes={ParallelizationMode.MULTIPROCESSING}, flight_server=flight_server
+            )
+
+        assert values == expected_value_int()
+        # The sink instance held in THIS (parent) process must never itself have received a direct write():
+        # under MULTIPROCESSING, the actual calculation and every sink.write() call happen inside a worker's
+        # pickled copy of the sink, and only that worker copy's flush() at graceful exit puts records on disk.
+        # If the parent's own sink._buffer were non-empty here, records would have been written synchronously
+        # in the parent instead of by a worker, which would prove nothing about waiting for the join.
+        assert sink._buffer == []
+        records = _read_lines(audit_path)
+        assert records
+        manifests = _read_lines(manifest_path)
+        assert len(manifests) == 1
+        manifest = manifests[0]
+        assert manifest["record_count"] == len(records)
+        assert manifest["compliant"] is True
+        head = verify_ndjson_log(audit_path, manifest_path, signer=signer)
+        assert head == manifest_hash(manifest)
+        assert {record["run_id"] for record in records} == {manifest["run_id"]}
+        assert [record["policy_version"] for record in records] == [extender.policy_version] * len(records)
+
+    def test_run_all_auto_seal_threads_previous_signers_through_to_seal_ndjson_runs(self, tmp_path: Path) -> None:
+        """A key rotated before the run starts; the extender is given the new signer plus the retired one in
+        previous_signers, which seal_ndjson_runs (and thus verify_ndjson_log) needs to verify the log's
+        earlier, still-old-key-signed entries. If previous_signers were dropped before reaching
+        seal_ndjson_runs, verification below would fail."""
+        audit_path = tmp_path / "audit.ndjson"
+        manifest_path = tmp_path / "manifests.ndjson"
+        old_signer = _signer(key_id="key-1")
+        new_signer = _signer(_OTHER_KEY, "key-2")
+        _write_records(audit_path, [_record("run-seed")])
+        seal_ndjson_runs(audit_path, manifest_path, signer=old_signer)
+        _rotate(manifest_path, new_signer, old_signer)
+        extender = AuditExtender(
+            sink=NdjsonAuditSink(audit_path),
+            audit_path=audit_path,
+            manifest_path=manifest_path,
+            signer=new_signer,
+            previous_signers=(old_signer,),
+        )
+
+        with verified_context(tenant_id="tenant-42"):
+            values = run_value_int(extender)
+
+        assert values == expected_value_int()
+        verify_ndjson_log(audit_path, manifest_path, signer=new_signer, previous_signers=[old_signer])
+
+    def test_run_all_fail_closed_plan_time_refusal_is_not_auto_sealed_but_a_manual_sweep_still_seals_it(
+        self, tmp_path: Path
+    ) -> None:
+        """Documents the limitation: on_run_complete never fires for a plan-time refusal (core's hook contract),
+        so the deny record it wrote stays unsealed until a manual seal_ndjson_runs sweep, which still works."""
+        audit_path = tmp_path / "audit.ndjson"
+        manifest_path = tmp_path / "manifests.ndjson"
+        signer = _signer()
+        extender = AuditExtender(
+            sink=NdjsonAuditSink(audit_path),
+            audit_path=audit_path,
+            manifest_path=manifest_path,
+            signer=signer,
+            fail_closed=True,
+        )
+
+        with pytest.raises(IdentityRequiredError):
+            run_value_int(extender)
+
+        records = _read_lines(audit_path)
+        assert len(records) == 1
+        assert records[0]["decision"] == "deny"
+        assert records[0]["hook"] == "FEATURE_GROUP_MATCHED"
+        assert not manifest_path.exists()
+
+        manifests = seal_ndjson_runs(audit_path, manifest_path, signer=signer)
+        verify_ndjson_log(audit_path, manifest_path, signer=signer)
 
         assert len(manifests) == 1
         assert manifests[0]["compliant"] is False
