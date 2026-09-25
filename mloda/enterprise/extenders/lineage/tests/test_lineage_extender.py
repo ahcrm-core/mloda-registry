@@ -122,6 +122,15 @@ class _MaskedByStringAttribute(_Derived):
     masking = "true"
 
 
+class _MaskedByPropertyMappingDefault(_Derived):
+    """Declares masking via a `PROPERTY_MAPPING` default, materialized by core rather than requested."""
+
+    outputs = ("lineage_facets_masked_property_default",)
+    PROPERTY_MAPPING: ClassVar[dict[str, PropertySpec] | None] = {
+        "masking": PropertySpec("masking flag", default=True, context=True)
+    }
+
+
 class _MidStep(_Derived):
     outputs = ("lineage_facets_limit_mid",)
 
@@ -134,6 +143,14 @@ class _TopRequestingMaskedMid(_Derived):
 
     def input_features(self, options: Options, feature_name: FeatureName) -> set[Feature] | None:
         return {Feature(name, options=Options(context={"masking": True})) for name in self.inputs}
+
+
+class _OtherTopRequestingMid(_Derived):
+    """Requests its mid-step input with the default `input_features`, so a propagated masking key on its own
+    request forwards to the mid instead of the mid owning it."""
+
+    outputs = ("lineage_facets_limit_top_other",)
+    inputs = _MidStep.outputs
 
 
 class _SharingOptionsWithInputs(_Derived):
@@ -386,6 +403,14 @@ def _inherited_source_column_options() -> Options:
     """Forwarded from a consumer, so core marks the key inherited."""
     options = Options()
     options.inherit_from(Options(context={_SOURCE_COLUMN: True}), inherit_context_keys=frozenset({_SOURCE_COLUMN}))
+    return options
+
+
+def _written_after_lock(key: str, value: Any) -> Options:
+    """Stands in for a matcher's write: added after own-key tracking is locked, so it never counts as own."""
+    options = Options()
+    options.lock_own_keys()
+    options.add_to_context(key, value)
     return options
 
 
@@ -662,6 +687,8 @@ _NOT_MASKED_CASES = [
     pytest.param(_Derived, lambda: Options(context={"masking": "true"}), id="context string"),
     pytest.param(_Derived, lambda: Options(context={"masking": False}), id="context false"),
     pytest.param(_MaskedByStringAttribute, lambda: Options(), id="class attribute string"),
+    pytest.param(_Derived, lambda: _written_after_lock("masking", True), id="written after own keys are locked"),
+    pytest.param(_MaskedByPropertyMappingDefault, lambda: Options(), id="property mapping default"),
 ]
 
 _SHARING_CASES = [
@@ -672,12 +699,16 @@ _SHARING_CASES = [
 _CONSUMER_HELD_CASES = [
     pytest.param(
         lambda: Options(context={"masking": True}, propagate_context_keys=frozenset({"masking"})),
-        False,
         True,
         id="propagated",
     ),
-    pytest.param(lambda: Options(context={"masking": True}), False, True, id="same value not propagated"),
-    pytest.param(lambda: Options(), True, False, id="consumer without the key"),
+    pytest.param(lambda: Options(context={"masking": True}), True, id="same value not propagated"),
+    pytest.param(lambda: Options(), False, id="consumer without the key"),
+]
+
+_SEVERAL_CONSUMERS_ORDERS = [
+    pytest.param((_TopRequestingMaskedMid, _OtherTopRequestingMid), id="own-request first"),
+    pytest.param((_OtherTopRequestingMid, _TopRequestingMaskedMid), id="propagated-request first"),
 ]
 
 
@@ -723,8 +754,8 @@ class TestLineageFacetsMasking:
     def test_a_forwarded_context_key_masks_only_the_declaring_step(
         self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
     ) -> None:
-        """propagate_context_keys copies the key onto the input features, so the upstream step's own options carry
-        it too; core marks it inherited and only the step that declared it reports masking."""
+        """propagate_context_keys copies the key onto the input feature's request, but the root only receives it
+        after own-key tracking is locked, so it is never the root's own key and only the declaring step is masked."""
         client, transport = ol_capture
         name = _Derived.outputs[0]
         options = Options(context={"masking": True}, propagate_context_keys=frozenset({"masking"}))
@@ -736,16 +767,15 @@ class TestLineageFacetsMasking:
         assert all(_run_facet(event).maskedFeatures == [name] for event in derived_events)
         assert all(_run_facet(event).maskedFeatures == [] for event in _events_for(transport.events, _job(_Root)))
 
-    @pytest.mark.parametrize(("make_options", "mid_masked", "top_masked"), _CONSUMER_HELD_CASES)
-    def test_a_steps_own_option_counts_unless_its_consumer_holds_it(
+    @pytest.mark.parametrize(("make_options", "top_masked"), _CONSUMER_HELD_CASES)
+    def test_a_steps_own_option_counts_even_when_its_consumer_holds_it(
         self,
         ol_capture: tuple[OpenLineageClient, RecordingTransport],
         make_options: Callable[[], Options],
-        mid_masked: bool,
         top_masked: bool,
     ) -> None:
-        """A step's option counts only when in its own context, not inherited, and not held equally by its consumer:
-        core cannot tell that from the consumer's value reaching the step by propagation, sharing or copying."""
+        """`_MidStep` does not declare masking itself; `_TopRequestingMaskedMid` requests it with its own fresh
+        Options declaring masking, so the mid is masked regardless of what the consumer's own request holds."""
         client, transport = ol_capture
         top = _TopRequestingMaskedMid.outputs[0]
         mid = _MidStep.outputs[0]
@@ -759,22 +789,46 @@ class TestLineageFacetsMasking:
 
         mid_events = _events_for(transport.events, _job(_MidStep))
         assert [event.eventType for event in mid_events] == [RunState.START, RunState.COMPLETE]
-        assert all(_run_facet(event).maskedFeatures == ([mid] if mid_masked else []) for event in mid_events)
-        assert [t.masking for t in _transformations(mid_events[-1], mid)] == [True if mid_masked else None]
+        assert all(_run_facet(event).maskedFeatures == [mid] for event in mid_events)
+        assert [t.masking for t in _transformations(mid_events[-1], mid)] == [True]
         top_events = _events_for(transport.events, _job(_TopRequestingMaskedMid))
         assert all(_run_facet(event).maskedFeatures == ([top] if top_masked else []) for event in top_events)
 
+    @pytest.mark.parametrize("order", _SEVERAL_CONSUMERS_ORDERS)
+    def test_several_consumers_own_key_counts_regardless_of_request_order(
+        self,
+        ol_capture: tuple[OpenLineageClient, RecordingTransport],
+        order: tuple[type[_Derived], type[_Derived]],
+    ) -> None:
+        """Two consumers request the same value-equal mid feature: one owns masking through its own fresh
+        Options, the other only propagates it. The merged mid request is masked in either request order."""
+        client, transport = ol_capture
+        mid = _MidStep.outputs[0]
+        top_options = {
+            _TopRequestingMaskedMid: Options(),
+            _OtherTopRequestingMid: Options(context={"masking": True}, propagate_context_keys=frozenset({"masking"})),
+        }
+        features = [Feature(feature_group.outputs[0], options=top_options[feature_group]) for feature_group in order]
+
+        _run(LineageFacetsExtender(client=client), features, _TopRequestingMaskedMid, _OtherTopRequestingMid, _MidStep)
+
+        mid_events = _events_for(transport.events, _job(_MidStep))
+        assert [event.eventType for event in mid_events] == [RunState.START, RunState.COMPLETE]
+        assert all(_run_facet(event).maskedFeatures == [mid] for event in mid_events)
+        assert [t.masking for t in _transformations(mid_events[-1], mid)] == [True]
+
     @pytest.mark.parametrize(("sharing", "root"), _SHARING_CASES)
-    def test_input_features_sharing_the_consumer_options_are_not_masked_by_them(
+    def test_input_features_sharing_the_consumer_options_are_masked_by_them_too(
         self,
         ol_capture: tuple[OpenLineageClient, RecordingTransport],
         sharing: type[_SharingOptionsWithInputs],
         root: type[_Root],
     ) -> None:
-        """Consumer Options shared with a root step, or rebuilt as a copy for its option default, mask only the
-        consumer, not the root step."""
+        """A consumer that hands its own Options object to an input feature, or has it rebuilt as a copy for its
+        option default, declares its own keys on the input too, so the root step is masked along with the consumer."""
         client, transport = ol_capture
         name = sharing.outputs[0]
+        root_name = sharing.inputs[0]
 
         _run(
             LineageFacetsExtender(client=client),
@@ -785,7 +839,7 @@ class TestLineageFacetsMasking:
 
         root_events = _events_for(transport.events, _job(root))
         assert [event.eventType for event in root_events] == [RunState.START, RunState.COMPLETE]
-        assert all(_run_facet(event).maskedFeatures == [] for event in root_events)
+        assert all(_run_facet(event).maskedFeatures == [root_name] for event in root_events)
         sharing_events = _events_for(transport.events, _job(sharing))
         assert all(_run_facet(event).maskedFeatures == [name] for event in sharing_events)
 
@@ -890,6 +944,7 @@ _NOT_DECLARED_CASES = [
     pytest.param(_SourceByFalse, lambda: Options(), id="class attribute false"),
     pytest.param(_SourceByOne, lambda: Options(), id="class attribute int"),
     pytest.param(_SourceByEmptyEntry, lambda: Options(), id="class attribute empty entry"),
+    pytest.param(_Loading, lambda: _written_after_lock(_SOURCE_COLUMN, "src"), id="written after own keys are locked"),
 ]
 
 _EDGE_LOADS = [
@@ -1024,25 +1079,14 @@ class TestLineageFacetsRootSourceColumns:
         assert "schema" in (_output(event, "out").facets or {})
         assert not _has_column_lineage(event, "out")
 
-    def test_a_source_column_the_consumer_holds_equally_is_not_the_steps_own(
-        self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
+    @pytest.mark.parametrize("consumer_value", ["src", "other"], ids=["consumer holds it equally", "consumer differs"])
+    def test_a_source_column_the_step_declares_is_its_own_regardless_of_what_the_consumer_holds(
+        self, ol_capture: tuple[OpenLineageClient, RecordingTransport], consumer_value: str
     ) -> None:
         options = {"out": Options(context={_SOURCE_COLUMN: "src"})}
 
         event = _calculate_loading_step(
-            ol_capture, _Loading, options, consumer_options=Options(context={_SOURCE_COLUMN: "src"})
-        )
-
-        assert "schema" in (_output(event, "out").facets or {})
-        assert not _has_column_lineage(event, "out")
-
-    def test_a_source_column_differing_from_the_consumers_is_the_steps_own(
-        self, ol_capture: tuple[OpenLineageClient, RecordingTransport]
-    ) -> None:
-        options = {"out": Options(context={_SOURCE_COLUMN: "src"})}
-
-        event = _calculate_loading_step(
-            ol_capture, _Loading, options, consumer_options=Options(context={_SOURCE_COLUMN: "other"})
+            ol_capture, _Loading, options, consumer_options=Options(context={_SOURCE_COLUMN: consumer_value})
         )
 
         assert _column_lineage(event, "out").fields == {"out": _root_edge(_LOADED, "src")}
